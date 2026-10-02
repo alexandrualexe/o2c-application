@@ -18,6 +18,13 @@
       "auth": {
         "kind": "dummy"
       }
+    },
+    "[production]": {
+      "requires": {
+        "auth": {
+          "kind": "dummy"
+        }
+      }
     }
   }
 }
