@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.cdsrc-private.json
+.env
+mta_archives/
+.DS_Store

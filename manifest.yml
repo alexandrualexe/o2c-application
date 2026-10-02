@@ -1,0 +1,9 @@
+applications:
+- name: o2c-returns-agent
+  memory: 256M
+  buildpacks:
+    - nodejs_buildpack
+  path: .
+  services:
+    - Connectivity
+    - Destinations
