@@ -5,9 +5,9 @@
     "node": "^22"
   },
   "dependencies": {
-    "@sap/cds": "^8",
     "@sap-cloud-sdk/connectivity": "^4.9.1",
     "@sap-cloud-sdk/http-client": "^4.9.1",
+    "@sap/cds": "^10.1.1",
     "express": "^4"
   },
   "scripts": {
