@@ -31,25 +31,23 @@ async function getCsrfTokenAndCookies(servicePath) {
     },
     { fetchCsrfToken: false }
   );
-
   const setCookie = response.headers['set-cookie'];
-
   return {
     csrfToken: response.headers['x-csrf-token'],
+    // Send back only name=value part of each cookie
     cookies: Array.isArray(setCookie)
-      ? setCookie.map((cookie) => cookie.split(';')[0]).join('; ')
+      ? setCookie.map((c) => c.split(';')[0]).join('; ')
       : ''
   };
 }
 
-// ---- Convert backend errors into CAP errors ----
+// ---- Convert backend errors into proper CAP errors ----
 function handleError(req, err, context) {
   const status = err.response?.status;
   const backendMsg =
     err.response?.data?.error?.message?.value ||
     err.response?.data?.error?.message ||
     err.message;
-
   console.error(`${context} failed:`, status, backendMsg);
   return req.reject(status || 500, `${context} failed: ${backendMsg}`);
 }
@@ -144,14 +142,13 @@ module.exports = function (srv) {
   // ---- getInvoice ----
   srv.on('getInvoice', async (req) => {
     const { invoiceNumber } = req.data;
-
     try {
       const response = await callDestination(
         'GET',
         `/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV/A_BillingDocument('${invoiceNumber}')?$expand=to_Item&$format=json`
       );
 
-      return JSON.stringify(unwrap(response.data));
+      return unwrap(response.data);
     } catch (err) {
       return handleError(req, err, 'getInvoice');
     }
@@ -160,7 +157,6 @@ module.exports = function (srv) {
   // ---- checkExistingCredits ----
   srv.on('checkExistingCredits', async (req) => {
     const { invoiceNumber } = req.data;
-
     try {
       const [returns, credits] = await Promise.all([
         callDestination(
@@ -173,10 +169,10 @@ module.exports = function (srv) {
         )
       ]);
 
-      return JSON.stringify({
+      return {
         existingReturns: unwrap(returns.data).results || [],
         existingCredits: unwrap(credits.data).results || []
-      });
+      };
     } catch (err) {
       return handleError(req, err, 'checkExistingCredits');
     }
@@ -229,7 +225,7 @@ module.exports = function (srv) {
         }
       );
 
-      return JSON.stringify(unwrap(response.data));
+      return unwrap(response.data);
     } catch (err) {
       return handleError(req, err, 'createReturn');
     }
@@ -246,8 +242,7 @@ module.exports = function (srv) {
       soldToParty
     } = req.data;
 
-    const servicePath =
-      '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV';
+    const servicePath = '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV';
 
     try {
       const { csrfToken, cookies } =
@@ -281,11 +276,12 @@ module.exports = function (srv) {
         }
       );
 
-      return JSON.stringify(unwrap(response.data));
+      return unwrap(response.data);
     } catch (err) {
       return handleError(req, err, 'createCreditMemoRequest');
     }
   });
+
   // ---- findInvoices: customer's invoices containing a material in a date range ----
   srv.on('findInvoices', async (req) => {
     const { soldToParty, material, fromDate, toDate } = req.data;
@@ -310,7 +306,7 @@ module.exports = function (srv) {
           to_Item: { results: (doc.to_Item?.results || []).filter((i) => i.Material === material) }
         }))
         .filter((doc) => doc.to_Item.results.length > 0);
-      return JSON.stringify({ soldToParty, material, fromDate, toDate, invoices });
+      return { soldToParty, material, fromDate, toDate, invoices };
     } catch (err) {
       return handleError(req, err, 'findInvoices');
     }
@@ -342,7 +338,7 @@ module.exports = function (srv) {
       );
 
       const records = unwrap(response.data).results || [];
-      return JSON.stringify({
+      return {
         soldToParty,
         material,
         salesOrganization,
@@ -355,7 +351,7 @@ module.exports = function (srv) {
           ConditionValidityStartDate: r.ConditionValidityStartDate,
           ConditionValidityEndDate: r.ConditionValidityEndDate
         }))
-      });
+      };
     } catch (err) {
       return handleError(req, err, 'getAgreedPrice');
     }
@@ -373,12 +369,12 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturn('${returnDocumentNumber}')?$format=json`
       );
       const returnData = unwrap(response.data);
-      return JSON.stringify({
+      return {
         returnDocumentNumber,
         overallProcessingStatus: returnData.OverallProcessingStatus,
         warehouseReceiptStatus: returnData.WarehouseReceiptStatus || 'UNKNOWN',
         received: returnData.WarehouseReceiptStatus === 'C'
-      });
+      };
     } catch (err) {
       return handleError(req, err, 'getReturnStatus');
     }
@@ -409,11 +405,11 @@ module.exports = function (srv) {
           'If-Match': versionStamp
         }
       );
-      return JSON.stringify({
+      return {
         creditMemoNumber,
         status: 'RELEASED',
         updateResult: unwrap(response.data)
-      });
+      };
     } catch (err) {
       return handleError(req, err, 'releaseCreditMemoRequest');
     }
