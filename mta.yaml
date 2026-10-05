@@ -1,0 +1,48 @@
+_schema-version: '3.1'
+ID: o2c-returns-agent
+version: 1.0.0
+parameters:
+  enable-parallel-deployments: true
+build-parameters:
+  before-all:
+    - builder: custom
+      commands:
+        - npm ci
+        - npx cds build --production
+
+modules:
+  - name: o2c-returns-agent
+    type: nodejs
+    path: gen/srv
+    parameters:
+      buildpack: nodejs_buildpack
+      memory: 256M
+      routes:
+        - route: o2c-returns-agent.${default-domain}
+    build-parameters:
+      builder: npm
+    requires:
+      - name: o2c-returns-hdi
+      - name: Destinations
+      - name: Connectivity
+
+  - name: o2c-returns-agent-db-deployer
+    type: hdb
+    path: gen/db
+    parameters:
+      buildpack: nodejs_buildpack
+    requires:
+      - name: o2c-returns-hdi
+
+resources:
+  - name: o2c-returns-hdi
+    type: com.sap.xs.hdi-container
+    parameters:
+      service: hana
+      service-plan: hdi-shared
+  - name: Destinations
+    type: org.cloudfoundry.existing-service
+  - name: Connectivity
+    type: org.cloudfoundry.existing-service
+
+description: "O2C Returns Service with audit logging."

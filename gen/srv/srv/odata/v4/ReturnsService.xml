@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:Reference Uri="https://oasis-tcs.github.io/odata-vocabularies/vocabularies/Org.OData.Capabilities.V1.xml">
+    <edmx:Include Alias="Capabilities" Namespace="Org.OData.Capabilities.V1"/>
+  </edmx:Reference>
+  <edmx:Reference Uri="https://sap.github.io/odata-vocabularies/vocabularies/Common.xml">
+    <edmx:Include Alias="Common" Namespace="com.sap.vocabularies.Common.v1"/>
+  </edmx:Reference>
+  <edmx:Reference Uri="https://oasis-tcs.github.io/odata-vocabularies/vocabularies/Org.OData.Core.V1.xml">
+    <edmx:Include Alias="Core" Namespace="Org.OData.Core.V1"/>
+  </edmx:Reference>
+  <edmx:Reference Uri="https://sap.github.io/odata-vocabularies/vocabularies/UI.xml">
+    <edmx:Include Alias="UI" Namespace="com.sap.vocabularies.UI.v1"/>
+  </edmx:Reference>
+  <edmx:DataServices>
+    <Schema Namespace="ReturnsService" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Annotation Term="Core.Links">
+        <Collection>
+          <Record>
+            <PropertyValue Property="rel" String="author"/>
+            <PropertyValue Property="href" String="https://cap.cloud.sap"/>
+          </Record>
+        </Collection>
+      </Annotation>
+      <EntityContainer Name="EntityContainer">
+        <EntitySet Name="AuditLog" EntityType="ReturnsService.AuditLog"/>
+        <ActionImport Name="logRequest" Action="ReturnsService.logRequest" EntitySet="AuditLog"/>
+        <ActionImport Name="setApprovalStatus" Action="ReturnsService.setApprovalStatus" EntitySet="AuditLog"/>
+        <FunctionImport Name="getInvoice" Function="ReturnsService.getInvoice"/>
+        <FunctionImport Name="checkExistingCredits" Function="ReturnsService.checkExistingCredits"/>
+        <FunctionImport Name="findInvoices" Function="ReturnsService.findInvoices"/>
+        <FunctionImport Name="getAgreedPrice" Function="ReturnsService.getAgreedPrice"/>
+        <FunctionImport Name="getReturnStatus" Function="ReturnsService.getReturnStatus"/>
+        <ActionImport Name="createReturn" Action="ReturnsService.createReturn"/>
+        <ActionImport Name="createCreditMemoRequest" Action="ReturnsService.createCreditMemoRequest"/>
+        <ActionImport Name="releaseCreditMemoRequest" Action="ReturnsService.releaseCreditMemoRequest"/>
+      </EntityContainer>
+      <EntityType Name="AuditLog">
+        <Key>
+          <PropertyRef Name="ID"/>
+        </Key>
+        <Property Name="ID" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="createdAt" Type="Edm.DateTimeOffset" Precision="7"/>
+        <Property Name="createdBy" Type="Edm.String" MaxLength="255"/>
+        <Property Name="modifiedAt" Type="Edm.DateTimeOffset" Precision="7"/>
+        <Property Name="modifiedBy" Type="Edm.String" MaxLength="255"/>
+        <Property Name="invoiceNumber" Type="Edm.String" MaxLength="10" Nullable="false"/>
+        <Property Name="proposedAction" Type="Edm.String" MaxLength="20" Nullable="false"/>
+        <Property Name="approvalStatus" Type="Edm.String" MaxLength="20" DefaultValue="PENDING"/>
+        <Property Name="decidedAt" Type="Edm.DateTimeOffset" Precision="7"/>
+        <Property Name="sapDocument" Type="Edm.String" MaxLength="10"/>
+      </EntityType>
+      <Action Name="logRequest" IsBound="false">
+        <Parameter Name="invoiceNumber" Type="Edm.String"/>
+        <Parameter Name="proposedAction" Type="Edm.String"/>
+        <ReturnType Type="ReturnsService.AuditLog"/>
+      </Action>
+      <Action Name="setApprovalStatus" IsBound="false">
+        <Parameter Name="ID" Type="Edm.Guid"/>
+        <Parameter Name="status" Type="Edm.String"/>
+        <ReturnType Type="ReturnsService.AuditLog"/>
+      </Action>
+      <Function Name="getInvoice" IsBound="false" IsComposable="false">
+        <Parameter Name="invoiceNumber" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Function Name="checkExistingCredits" IsBound="false" IsComposable="false">
+        <Parameter Name="invoiceNumber" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Function Name="findInvoices" IsBound="false" IsComposable="false">
+        <Parameter Name="soldToParty" Type="Edm.String"/>
+        <Parameter Name="material" Type="Edm.String"/>
+        <Parameter Name="fromDate" Type="Edm.String"/>
+        <Parameter Name="toDate" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Function Name="getAgreedPrice" IsBound="false" IsComposable="false">
+        <Parameter Name="soldToParty" Type="Edm.String"/>
+        <Parameter Name="material" Type="Edm.String"/>
+        <Parameter Name="salesOrganization" Type="Edm.String"/>
+        <Parameter Name="distributionChannel" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Function Name="getReturnStatus" IsBound="false" IsComposable="false">
+        <Parameter Name="returnDocumentNumber" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Action Name="createReturn" IsBound="false">
+        <Parameter Name="invoiceNumber" Type="Edm.String"/>
+        <Parameter Name="invoiceItem" Type="Edm.String"/>
+        <Parameter Name="material" Type="Edm.String"/>
+        <Parameter Name="quantity" Type="Edm.String"/>
+        <Parameter Name="unit" Type="Edm.String"/>
+        <Parameter Name="reason" Type="Edm.String"/>
+        <Parameter Name="soldToParty" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Action>
+      <Action Name="createCreditMemoRequest" IsBound="false">
+        <Parameter Name="invoiceNumber" Type="Edm.String"/>
+        <Parameter Name="material" Type="Edm.String"/>
+        <Parameter Name="quantity" Type="Edm.String"/>
+        <Parameter Name="unit" Type="Edm.String"/>
+        <Parameter Name="reason" Type="Edm.String"/>
+        <Parameter Name="soldToParty" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Action>
+      <Action Name="releaseCreditMemoRequest" IsBound="false">
+        <Parameter Name="creditMemoNumber" Type="Edm.String"/>
+        <Parameter Name="versionStamp" Type="Edm.String"/>
+        <ReturnType Type="Edm.String"/>
+      </Action>
+      <Annotations Target="ReturnsService.EntityContainer/AuditLog">
+        <Annotation Term="Capabilities.DeleteRestrictions">
+          <Record Type="Capabilities.DeleteRestrictionsType">
+            <PropertyValue Property="Deletable" Bool="false"/>
+          </Record>
+        </Annotation>
+        <Annotation Term="Capabilities.InsertRestrictions">
+          <Record Type="Capabilities.InsertRestrictionsType">
+            <PropertyValue Property="Insertable" Bool="false"/>
+          </Record>
+        </Annotation>
+        <Annotation Term="Capabilities.UpdateRestrictions">
+          <Record Type="Capabilities.UpdateRestrictionsType">
+            <PropertyValue Property="Updatable" Bool="false"/>
+          </Record>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.AuditLog/ID">
+        <Annotation Term="Core.ComputedDefaultValue" Bool="true"/>
+      </Annotations>
+      <Annotations Target="ReturnsService.AuditLog/createdAt">
+        <Annotation Term="UI.HiddenFilter" Bool="true"/>
+        <Annotation Term="UI.ExcludeFromNavigationContext" Bool="true"/>
+        <Annotation Term="Core.Immutable" Bool="true"/>
+        <Annotation Term="Core.Computed" Bool="true"/>
+        <Annotation Term="Common.Label" String="{i18n>CreatedAt}"/>
+      </Annotations>
+      <Annotations Target="ReturnsService.AuditLog/createdBy">
+        <Annotation Term="UI.HiddenFilter" Bool="true"/>
+        <Annotation Term="UI.ExcludeFromNavigationContext" Bool="true"/>
+        <Annotation Term="Core.Immutable" Bool="true"/>
+        <Annotation Term="Core.Computed" Bool="true"/>
+        <Annotation Term="Core.Description" String="{i18n>UserID.Description}"/>
+        <Annotation Term="Common.Label" String="{i18n>CreatedBy}"/>
+      </Annotations>
+      <Annotations Target="ReturnsService.AuditLog/modifiedAt">
+        <Annotation Term="UI.HiddenFilter" Bool="true"/>
+        <Annotation Term="UI.ExcludeFromNavigationContext" Bool="true"/>
+        <Annotation Term="Core.Computed" Bool="true"/>
+        <Annotation Term="Common.Label" String="{i18n>ChangedAt}"/>
+      </Annotations>
+      <Annotations Target="ReturnsService.AuditLog/modifiedBy">
+        <Annotation Term="UI.HiddenFilter" Bool="true"/>
+        <Annotation Term="UI.ExcludeFromNavigationContext" Bool="true"/>
+        <Annotation Term="Core.Computed" Bool="true"/>
+        <Annotation Term="Core.Description" String="{i18n>UserID.Description}"/>
+        <Annotation Term="Common.Label" String="{i18n>ChangedBy}"/>
+      </Annotations>
+      <Annotations Target="ReturnsService.getInvoice(Edm.String)/invoiceNumber">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.checkExistingCredits(Edm.String)/invoiceNumber">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.findInvoices(Edm.String,Edm.String,Edm.String,Edm.String)/soldToParty">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.findInvoices(Edm.String,Edm.String,Edm.String,Edm.String)/material">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.findInvoices(Edm.String,Edm.String,Edm.String,Edm.String)/fromDate">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.findInvoices(Edm.String,Edm.String,Edm.String,Edm.String)/toDate">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.getAgreedPrice(Edm.String,Edm.String,Edm.String,Edm.String)/soldToParty">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.getAgreedPrice(Edm.String,Edm.String,Edm.String,Edm.String)/material">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.getAgreedPrice(Edm.String,Edm.String,Edm.String,Edm.String)/salesOrganization">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.getAgreedPrice(Edm.String,Edm.String,Edm.String,Edm.String)/distributionChannel">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="ReturnsService.getReturnStatus(Edm.String)/returnDocumentNumber">
+        <Annotation Term="Core.OptionalParameter">
+          <Record Type="Core.OptionalParameterType"/>
+        </Annotation>
+      </Annotations>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
