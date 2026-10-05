@@ -449,6 +449,7 @@ module.exports = function (srv) {
   });
 
   // ---- setApprovalStatus: decide a pending request ----
+  // CHANGE 5: Re-check SAP before approval to catch duplicates created between investigation and approval
   srv.on('setApprovalStatus', async (req) => {
     const { ID, status, approvedBy, approverRole } = req.data;
 
@@ -486,6 +487,17 @@ module.exports = function (srv) {
     const required = auditLog.requiredApprover;
     if (!allowedRoles[required] || !allowedRoles[required].includes(approverRole)) {
       return req.reject(403, `Role ${approverRole} cannot approve. Required: ${required}`);
+    }
+
+    // CHANGE 5: Re-check SAP before approval to catch duplicates
+    try {
+      const existingCreds = await tx.send('checkExistingCredits', { invoiceNumber: auditLog.invoiceNumber });
+      if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
+        const existing = existingCreds.existingReturns?.[0] || existingCreds.existingCredits?.[0];
+        return req.reject(409, `Duplicate in SAP: ${existing.CustomerReturn || existing.CreditMemoRequest} already exists for this invoice. Approval blocked.`);
+      }
+    } catch (err) {
+      console.warn('Re-check checkExistingCredits failed (non-fatal):', err.message);
     }
 
     // Update status
@@ -633,6 +645,7 @@ module.exports = function (srv) {
     try {
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
+      // CHANGE 4: Set Cust. Reference to COMPLAINT-<invoice> only (removed rule and UUID suffix)
       const payload = {
         CustomerReturnType: 'YRE',
         SalesOrganization: 'YSOD',
@@ -640,7 +653,7 @@ module.exports = function (srv) {
         OrganizationDivision: 'Y5',
         SoldToParty: soldToParty,
         SDDocumentReason: orderReason,
-        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}-${auditLogID.substring(0, 8)}`,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
         HeaderBillingBlockReason: '08', // Billing block: Check Credit Memo
         to_Item: [{
           Material: material,
@@ -650,6 +663,8 @@ module.exports = function (srv) {
           ReferenceSDDocumentItem: invoiceItem
         }]
       };
+
+      console.log('createReturn payload:', JSON.stringify(payload, null, 2));
 
       const response = await callDestination(
         'POST',
@@ -755,6 +770,7 @@ module.exports = function (srv) {
     try {
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
+      // CHANGE 4: Set Cust. Reference to COMPLAINT-<invoice> only (removed rule and UUID suffix)
       const payload = {
         SalesDocumentType: 'YCR',
         SalesOrganization: 'YSOD',
@@ -762,7 +778,7 @@ module.exports = function (srv) {
         OrganizationDivision: 'Y5',
         SoldToParty: soldToParty,
         SDDocumentReason: orderReason,
-        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}-${auditLogID.substring(0, 8)}`,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
         HeaderBillingBlockReason: '08', // Billing block: Check Credit Memo
         to_Item: [{
           Material: material,
@@ -771,6 +787,8 @@ module.exports = function (srv) {
           ReferenceSDDocument: invoiceNumber
         }]
       };
+
+      console.log('createCreditMemoRequest payload:', JSON.stringify(payload, null, 2));
 
       const response = await callDestination(
         'POST',
@@ -880,6 +898,7 @@ module.exports = function (srv) {
   });
 
   // ---- getReturnStatus: check if goods were received (for audit trail) ----
+  // CHANGE 3: Implemented for step 5.1.3 - reports when goods are received (GoodsMovementStatus = C)
   srv.on('getReturnStatus', async (req) => {
     const { returnDocumentNumber } = req.data;
     if (!returnDocumentNumber) {
@@ -891,12 +910,14 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturn('${returnDocumentNumber}')?$format=json`
       );
       const returnData = unwrap(response.data);
-      const received = returnData.WarehouseReceiptStatus === 'C';
+      const received = returnData.GoodsMovementStatus === 'C';
+
+      console.log(`getReturnStatus for ${returnDocumentNumber}: GoodsMovementStatus=${returnData.GoodsMovementStatus}, received=${received}`);
 
       return {
         returnDocumentNumber,
         overallProcessingStatus: returnData.OverallProcessingStatus,
-        warehouseReceiptStatus: returnData.WarehouseReceiptStatus || 'UNKNOWN',
+        goodsMovementStatus: returnData.GoodsMovementStatus || 'UNKNOWN',
         received
       };
     } catch (err) {
