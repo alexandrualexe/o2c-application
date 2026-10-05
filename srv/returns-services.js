@@ -1,156 +1,179 @@
 const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
 
-// ---- Generic GET/POST helper (no CSRF) ----
-async function callDestination(destinationName, method, path, payload, extraHeaders = {}) {
-  const response = await executeHttpRequest(
-    { destinationName },
+const DEST = 'DS4';
+const SAP_CLIENT = '100';
+
+// ---- Generic request helper ----
+async function callDestination(method, path, payload, extraHeaders = {}) {
+  return executeHttpRequest(
+    { destinationName: DEST },
     {
       method,
       url: path,
       data: payload,
-      headers: { 'sap-client': '100', ...extraHeaders }
+      headers: { 'sap-client': SAP_CLIENT, ...extraHeaders }
     }
   );
-  return response;
 }
 
-// ---- CSRF token fetch for POST-based OData calls ----
-async function getCsrfTokenAndCookies(destinationName, servicePath) {
+// ---- CSRF token + cookies for POST calls ----
+async function getCsrfTokenAndCookies(servicePath) {
   const response = await executeHttpRequest(
-    { destinationName },
+    { destinationName: DEST },
     {
       method: 'GET',
       url: `${servicePath}/`,
-      headers: { 'x-csrf-token': 'Fetch', 'sap-client': '100' }
+      headers: { 'x-csrf-token': 'Fetch', 'sap-client': SAP_CLIENT }
     },
     { fetchCsrfToken: false }
   );
+  const setCookie = response.headers['set-cookie'];
   return {
     csrfToken: response.headers['x-csrf-token'],
-    cookies: response.headers['set-cookie']
+    // Send back only name=value part of each cookie
+    cookies: Array.isArray(setCookie)
+      ? setCookie.map((c) => c.split(';')[0]).join('; ')
+      : ''
   };
 }
+
+// ---- Convert backend errors into proper CAP errors ----
+function handleError(req, err, context) {
+  const status = err.response?.status;
+  const backendMsg =
+    err.response?.data?.error?.message?.value ||
+    err.response?.data?.error?.message ||
+    err.message;
+  console.error(`${context} failed:`, status, backendMsg);
+  return req.reject(status || 500, `${context} failed: ${backendMsg}`);
+}
+
+// ---- SAP OData v2 returns { d: ... } ----
+const unwrap = (data) => (data && data.d !== undefined ? data.d : data);
 
 module.exports = function (srv) {
 
   // ---- getInvoice ----
   srv.on('getInvoice', async (req) => {
     const { invoiceNumber } = req.data;
-    const response = await callDestination(
-      'DS4',
-      'GET',
-      `/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV/A_BillingDocument('${invoiceNumber}')?$expand=to_Item&$format=json`
-    );
-    return JSON.stringify(response.data.d);
+    try {
+      const response = await callDestination(
+        'GET',
+        `/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV/A_BillingDocument('${invoiceNumber}')?$expand=to_Item&$format=json`
+      );
+      return unwrap(response.data);
+    } catch (err) {
+      return handleError(req, err, 'getInvoice');
+    }
   });
 
   // ---- checkExistingCredits ----
   srv.on('checkExistingCredits', async (req) => {
     const { invoiceNumber } = req.data;
+    try {
+      const [returns, credits] = await Promise.all([
+        callDestination(
+          'GET',
+          `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturnItem?$filter=ReferenceSDDocument eq '${invoiceNumber}'&$format=json`
+        ),
+        callDestination(
+          'GET',
+          `/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV/A_CreditMemoRequest?$filter=ReferenceSDDocument eq '${invoiceNumber}'&$format=json`
+        )
+      ]);
 
-    const returns = await callDestination(
-      'DS4',
-      'GET',
-      `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturnItem?$filter=ReferenceSDDocument eq '${invoiceNumber}'&$format=json`
-    );
-
-    const credits = await callDestination(
-      'DS4',
-      'GET',
-      `/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV/A_CreditMemoRequest?$filter=ReferenceSDDocument eq '${invoiceNumber}'&$format=json`
-    );
-
-    return JSON.stringify({
-      existingReturns: returns.data.d.results,
-      existingCredits: credits.data.d.results
-    });
+      return {
+        existingReturns: unwrap(returns.data).results || [],
+        existingCredits: unwrap(credits.data).results || []
+      };
+    } catch (err) {
+      return handleError(req, err, 'checkExistingCredits');
+    }
   });
 
   // ---- createReturn ----
   srv.on('createReturn', async (req) => {
     const { invoiceNumber, invoiceItem, material, quantity, unit, reason, soldToParty } = req.data;
+    const servicePath = '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV';
 
-    const { csrfToken, cookies } = await getCsrfTokenAndCookies(
-      'DS4',
-      '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV'
-    );
+    try {
+      const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
-    const payload = {
-      CustomerReturnType: 'YRE',
-      SalesOrganization: 'YSOD',
-      DistributionChannel: 'Y1',
-      OrganizationDivision: 'Y5',
-      SoldToParty: soldToParty,
-      SDDocumentReason: reason,
-      PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
-      to_Item: [{
-        Material: material,
-        RequestedQuantity: quantity,
-        RequestedQuantityUnit: unit,
-        ReferenceSDDocument: invoiceNumber,
-        ReferenceSDDocumentItem: invoiceItem
-      }]
-    };
+      const payload = {
+        CustomerReturnType: 'YRE',
+        SalesOrganization: 'YSOD',
+        DistributionChannel: 'Y1',
+        OrganizationDivision: 'Y5',
+        SoldToParty: soldToParty,
+        SDDocumentReason: reason,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
+        to_Item: [{
+          Material: material,
+          RequestedQuantity: quantity,
+          RequestedQuantityUnit: unit,
+          ReferenceSDDocument: invoiceNumber,
+          ReferenceSDDocumentItem: invoiceItem
+        }]
+      };
 
-    const response = await executeHttpRequest(
-      { destinationName: 'DS4' },
-      {
-        method: 'POST',
-        url: '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturn',
-        data: payload,
-        headers: {
+      const response = await callDestination(
+        'POST',
+        `${servicePath}/A_CustomerReturn`,
+        payload,
+        {
           'x-csrf-token': csrfToken,
-          'Cookie': cookies ? cookies.join('; ') : '',
+          'Cookie': cookies,
           'Content-Type': 'application/json',
-          'sap-client': '100'
+          'Accept': 'application/json'
         }
-      }
-    );
+      );
 
-    return JSON.stringify(response.data.d);
+      return unwrap(response.data);
+    } catch (err) {
+      return handleError(req, err, 'createReturn');
+    }
   });
 
   // ---- createCreditMemoRequest ----
   srv.on('createCreditMemoRequest', async (req) => {
     const { invoiceNumber, material, quantity, unit, reason, soldToParty } = req.data;
+    const servicePath = '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV';
 
-    const { csrfToken, cookies } = await getCsrfTokenAndCookies(
-      'DS4',
-      '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV'
-    );
+    try {
+      const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
-    const payload = {
-      SalesDocumentType: 'YCR',
-      SalesOrganization: 'YSOD',
-      DistributionChannel: 'Y1',
-      OrganizationDivision: 'Y5',
-      SoldToParty: soldToParty,
-      SDDocumentReason: reason,
-      PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
-      to_Item: [{
-        Material: material,
-        RequestedQuantity: quantity,
-        RequestedQuantityUnit: unit,
-        ReferenceSDDocument: invoiceNumber
-      }]
-    };
+      const payload = {
+        SalesDocumentType: 'YCR',
+        SalesOrganization: 'YSOD',
+        DistributionChannel: 'Y1',
+        OrganizationDivision: 'Y5',
+        SoldToParty: soldToParty,
+        SDDocumentReason: reason,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}`,
+        to_Item: [{
+          Material: material,
+          RequestedQuantity: quantity,
+          RequestedQuantityUnit: unit,
+          ReferenceSDDocument: invoiceNumber
+        }]
+      };
 
-    const response = await executeHttpRequest(
-      { destinationName: 'DS4' },
-      {
-        method: 'POST',
-        url: '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV/A_CreditMemoRequest',
-        data: payload,
-        headers: {
+      const response = await callDestination(
+        'POST',
+        `${servicePath}/A_CreditMemoRequest`,
+        payload,
+        {
           'x-csrf-token': csrfToken,
-          'Cookie': cookies ? cookies.join('; ') : '',
+          'Cookie': cookies,
           'Content-Type': 'application/json',
-          'sap-client': '100'
+          'Accept': 'application/json'
         }
-      }
-    );
+      );
 
-    return JSON.stringify(response.data.d);
+      return unwrap(response.data);
+    } catch (err) {
+      return handleError(req, err, 'createCreditMemoRequest');
+    }
   });
 
 };
