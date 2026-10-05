@@ -691,7 +691,16 @@ module.exports = function (srv) {
           .where({ ID: auditLogID })
       );
 
-      return returnDoc;
+      return {
+        CustomerReturn: returnDoc.CustomerReturn,
+        SalesDocumentType: returnDoc.SalesDocumentType,
+        SoldToParty: returnDoc.SoldToParty,
+        SDDocumentReason: returnDoc.SDDocumentReason,
+        TotalNetAmount: returnDoc.TotalNetAmount,
+        TransactionCurrency: returnDoc.TransactionCurrency,
+        OverallSDProcessStatus: returnDoc.OverallSDProcessStatus,
+        sapDocumentVersion: returnDoc.__metadata?.version || returnDoc.version
+      };
     } catch (err) {
       return handleError(req, err, 'createReturn');
     }
@@ -816,7 +825,16 @@ module.exports = function (srv) {
           .where({ ID: auditLogID })
       );
 
-      return creditDoc;
+      return {
+        CreditMemoRequest: creditDoc.CreditMemoRequest,
+        SalesDocumentType: creditDoc.SalesDocumentType,
+        SoldToParty: creditDoc.SoldToParty,
+        SDDocumentReason: creditDoc.SDDocumentReason,
+        TotalNetAmount: creditDoc.TotalNetAmount,
+        TransactionCurrency: creditDoc.TransactionCurrency,
+        OverallSDProcessStatus: creditDoc.OverallSDProcessStatus,
+        sapDocumentVersion: creditDoc.__metadata?.version || creditDoc.version
+      };
     } catch (err) {
       return handleError(req, err, 'createCreditMemoRequest');
     }
