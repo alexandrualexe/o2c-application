@@ -133,6 +133,14 @@ async function getCsrfTokenAndCookies(servicePath) {
   };
 }
 
+// Read a document's current ETag (the stored one goes stale once SAP changes the document, e.g. goods receipt)
+async function fetchCurrentEtag(entityPath) {
+  const response = await callDestination('GET', `${entityPath}?$format=json`);
+  const etag = getEtag(response, unwrap(response.data));
+  if (!etag) throw new Error(`No ETag returned for ${entityPath}`);
+  return etag;
+}
+
 // Convert backend errors into proper CAP errors
 function handleError(req, err, context) {
   const status = err.response?.status;
@@ -147,12 +155,36 @@ function handleError(req, err, context) {
 // SAP OData v2 returns { d: ... }
 const unwrap = (data) => (data && data.d !== undefined ? data.d : data);
 
+// SAP document numbers (invoice, return, credit memo) are interpolated into OData URLs, so restrict them
+const isDocNumber = (v) => typeof v === 'string' && /^[A-Za-z0-9]{1,10}$/.test(v);
+
+// OData v2 puts the ETag in __metadata.etag; the ETag response header is the fallback
+const getEtag = (response, doc) => doc?.__metadata?.etag || response?.headers?.etag || null;
+
+// Returns an error message if the request doesn't match the approved audit entry, else null
+function approvalMismatch(auditLog, { invoiceNumber, rule }) {
+  if (auditLog.invoiceNumber !== invoiceNumber) {
+    return `invoiceNumber ${invoiceNumber} does not match approved request (${auditLog.invoiceNumber})`;
+  }
+  if (auditLog.rule !== rule) {
+    return `rule ${rule} does not match approved request (${auditLog.rule})`;
+  }
+  if (auditLog.proposedAction !== RULES[rule].proposedAction) {
+    return `Approved request is ${auditLog.proposedAction}, not ${RULES[rule].proposedAction}; no document can be created`;
+  }
+  return null;
+}
+
 module.exports = function (srv) {
   const { AuditLog } = srv.entities;
 
   // ---- proposeAction: R1-R9 decision tree ----
   srv.on('proposeAction', async (req) => {
     const { invoiceNumber, invoiceItem, material, quantity, claimedAmount, reason, soldToParty } = req.data;
+
+    if (!isDocNumber(invoiceNumber)) {
+      return req.reject(400, 'invoiceNumber must be 1–10 letters or digits');
+    }
 
     try {
       // Get the invoice to validate
@@ -239,7 +271,7 @@ module.exports = function (srv) {
 
       // Also check SAP for existing returns/credit memos
       try {
-        const existingCreds = await tx.send('checkExistingCredits', { invoiceNumber });
+        const existingCreds = await srv.send('checkExistingCredits', { invoiceNumber });
         if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
           const existing = existingCreds.existingReturns?.[0] || existingCreds.existingCredits?.[0];
           return {
@@ -305,7 +337,7 @@ module.exports = function (srv) {
         // Query agreed price from SAP PR00 condition
         let agreedPrice = invoicedPrice; // Default to invoiced price
         try {
-          const priceResult = await tx.send('getAgreedPrice', {
+          const priceResult = await srv.send('getAgreedPrice', {
             soldToParty: soldToParty || '',
             material: material || '',
             salesOrganization: invoice.SalesOrganization,
@@ -489,15 +521,17 @@ module.exports = function (srv) {
       return req.reject(403, `Role ${approverRole} cannot approve. Required: ${required}`);
     }
 
-    // CHANGE 5: Re-check SAP before approval to catch duplicates
-    try {
-      const existingCreds = await tx.send('checkExistingCredits', { invoiceNumber: auditLog.invoiceNumber });
-      if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
-        const existing = existingCreds.existingReturns?.[0] || existingCreds.existingCredits?.[0];
-        return req.reject(409, `Duplicate in SAP: ${existing.CustomerReturn || existing.CreditMemoRequest} already exists for this invoice. Approval blocked.`);
+    // CHANGE 5: Re-check SAP before approval to catch duplicates (rejecting is always allowed)
+    if (status === 'APPROVED') {
+      try {
+        const existingCreds = await srv.send('checkExistingCredits', { invoiceNumber: auditLog.invoiceNumber });
+        if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
+          const existing = existingCreds.existingReturns?.[0] || existingCreds.existingCredits?.[0];
+          return req.reject(409, `Duplicate in SAP: ${existing.CustomerReturn || existing.CreditMemoRequest} already exists for this invoice. Approval blocked.`);
+        }
+      } catch (err) {
+        console.warn('Re-check checkExistingCredits failed (non-fatal):', err.message);
       }
-    } catch (err) {
-      console.warn('Re-check checkExistingCredits failed (non-fatal):', err.message);
     }
 
     // Update status
@@ -551,6 +585,9 @@ module.exports = function (srv) {
   // ---- getInvoice ----
   srv.on('getInvoice', async (req) => {
     const { invoiceNumber } = req.data;
+    if (!isDocNumber(invoiceNumber)) {
+      return req.reject(400, 'invoiceNumber must be 1–10 letters or digits');
+    }
     try {
       const response = await callDestination(
         'GET',
@@ -566,6 +603,9 @@ module.exports = function (srv) {
   // ---- checkExistingCredits: R8 - check for duplicate complaints ----
   srv.on('checkExistingCredits', async (req) => {
     const { invoiceNumber } = req.data;
+    if (!isDocNumber(invoiceNumber)) {
+      return req.reject(400, 'invoiceNumber must be 1–10 letters or digits');
+    }
     try {
       const [returns, credits] = await Promise.all([
         callDestination(
@@ -624,6 +664,12 @@ module.exports = function (srv) {
 
     if (auditLog.sapDocument) {
       return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
+    }
+
+    // The document must match what was approved (no reusing an approval for another invoice or rule)
+    const mismatch = approvalMismatch(auditLog, { invoiceNumber, rule });
+    if (mismatch) {
+      return req.reject(400, mismatch);
     }
 
     // Check for duplicate in SAP
@@ -686,20 +732,20 @@ module.exports = function (srv) {
           .set({
             sapDocument: returnDoc.CustomerReturn,
             sapDocumentType: 'YRE',
-            sapDocumentVersion: returnDoc.__metadata?.version || returnDoc.version
+            sapDocumentVersion: getEtag(response, returnDoc)
           })
           .where({ ID: auditLogID })
       );
 
       return {
         CustomerReturn: returnDoc.CustomerReturn,
-        SalesDocumentType: returnDoc.SalesDocumentType,
+        CustomerReturnType: returnDoc.CustomerReturnType,
         SoldToParty: returnDoc.SoldToParty,
         SDDocumentReason: returnDoc.SDDocumentReason,
         TotalNetAmount: returnDoc.TotalNetAmount,
         TransactionCurrency: returnDoc.TransactionCurrency,
         OverallSDProcessStatus: returnDoc.OverallSDProcessStatus,
-        sapDocumentVersion: returnDoc.__metadata?.version || returnDoc.version
+        sapDocumentVersion: getEtag(response, returnDoc)
       };
     } catch (err) {
       return handleError(req, err, 'createReturn');
@@ -748,6 +794,12 @@ module.exports = function (srv) {
 
     if (auditLog.sapDocument) {
       return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
+    }
+
+    // The document must match what was approved (no reusing an approval for another invoice or rule)
+    const mismatch = approvalMismatch(auditLog, { invoiceNumber, rule });
+    if (mismatch) {
+      return req.reject(400, mismatch);
     }
 
     // R3 requires evidence
@@ -825,7 +877,7 @@ module.exports = function (srv) {
           .set({
             sapDocument: creditDoc.CreditMemoRequest,
             sapDocumentType: 'YCR',
-            sapDocumentVersion: creditDoc.__metadata?.version || creditDoc.version,
+            sapDocumentVersion: getEtag(response, creditDoc),
             warehouseCheckNeeded: rule === 'R5'
           })
           .where({ ID: auditLogID })
@@ -833,13 +885,13 @@ module.exports = function (srv) {
 
       return {
         CreditMemoRequest: creditDoc.CreditMemoRequest,
-        SalesDocumentType: creditDoc.SalesDocumentType,
+        SalesDocumentType: creditDoc.CreditMemoRequestType || creditDoc.SalesDocumentType,
         SoldToParty: creditDoc.SoldToParty,
         SDDocumentReason: creditDoc.SDDocumentReason,
         TotalNetAmount: creditDoc.TotalNetAmount,
         TransactionCurrency: creditDoc.TransactionCurrency,
         OverallSDProcessStatus: creditDoc.OverallSDProcessStatus,
-        sapDocumentVersion: creditDoc.__metadata?.version || creditDoc.version
+        sapDocumentVersion: getEtag(response, creditDoc)
       };
     } catch (err) {
       return handleError(req, err, 'createCreditMemoRequest');
@@ -940,7 +992,7 @@ module.exports = function (srv) {
 
       return {
         returnDocumentNumber,
-        overallProcessingStatus: returnData.OverallProcessingStatus,
+        overallProcessingStatus: returnData.OverallSDProcessStatus ?? returnData.OverallProcessingStatus,
         goodsMovementStatus: returnData.GoodsMovementStatus || 'UNKNOWN',
         received
       };
@@ -951,12 +1003,14 @@ module.exports = function (srv) {
 
   // ---- releaseCreditMemoRequest: remove billing block 08 after approval ----
   srv.on('releaseCreditMemoRequest', async (req) => {
-    const { creditMemoNumber, versionStamp } = req.data;
-    if (!creditMemoNumber || !versionStamp) {
-      return req.reject(400, 'creditMemoNumber and versionStamp are required');
+    const { creditMemoNumber } = req.data;
+    if (!isDocNumber(creditMemoNumber)) {
+      return req.reject(400, 'creditMemoNumber must be 1–10 letters or digits');
     }
     const servicePath = '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV';
     try {
+      const versionStamp = req.data.versionStamp ||
+        await fetchCurrentEtag(`${servicePath}/A_CreditMemoRequest('${creditMemoNumber}')`);
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
       const payload = {
         HeaderBillingBlockReason: '' // Remove block 08
@@ -984,12 +1038,14 @@ module.exports = function (srv) {
 
   // ---- releaseCustomerReturn: remove billing block 08 after approval ----
   srv.on('releaseCustomerReturn', async (req) => {
-    const { returnDocumentNumber, versionStamp } = req.data;
-    if (!returnDocumentNumber || !versionStamp) {
-      return req.reject(400, 'returnDocumentNumber and versionStamp are required');
+    const { returnDocumentNumber } = req.data;
+    if (!isDocNumber(returnDocumentNumber)) {
+      return req.reject(400, 'returnDocumentNumber must be 1–10 letters or digits');
     }
     const servicePath = '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV';
     try {
+      const versionStamp = req.data.versionStamp ||
+        await fetchCurrentEtag(`${servicePath}/A_CustomerReturn('${returnDocumentNumber}')`);
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
       const payload = {
         HeaderBillingBlockReason: '' // Remove block 08

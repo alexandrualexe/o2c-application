@@ -45,7 +45,7 @@ service ReturnsService {
     TransactionCurrency     : String;
     ReferenceSDDocument     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type ExistingCreditsResult {
@@ -81,7 +81,7 @@ service ReturnsService {
   type ReturnStatusResult {
     returnDocumentNumber    : String;
     overallProcessingStatus : String;
-    warehouseReceiptStatus  : String;
+    goodsMovementStatus     : String;
     received                : Boolean;
   };
 
@@ -90,8 +90,10 @@ service ReturnsService {
     CustomerReturnType      : String;
     SoldToParty             : String;
     SDDocumentReason        : String;
+    TotalNetAmount          : String;
+    TransactionCurrency     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type CreditMemoResult {
@@ -102,7 +104,7 @@ service ReturnsService {
     TotalNetAmount          : String;
     TransactionCurrency     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type ReleaseCreditMemoResult {
