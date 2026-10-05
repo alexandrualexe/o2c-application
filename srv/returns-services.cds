@@ -2,6 +2,7 @@ using o2c from '../db/schema';
 
 service ReturnsService {
   @readonly entity AuditLog as projection on o2c.ReturnAuditLog;
+  @readonly entity InboundEmails as projection on o2c.InboundEmail;
 
   // ---------- Shared types ----------
   type InvoiceItem {
@@ -45,7 +46,7 @@ service ReturnsService {
     TransactionCurrency     : String;
     ReferenceSDDocument     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type ExistingCreditsResult {
@@ -81,7 +82,7 @@ service ReturnsService {
   type ReturnStatusResult {
     returnDocumentNumber    : String;
     overallProcessingStatus : String;
-    warehouseReceiptStatus  : String;
+    goodsMovementStatus     : String;
     received                : Boolean;
   };
 
@@ -90,8 +91,10 @@ service ReturnsService {
     CustomerReturnType      : String;
     SoldToParty             : String;
     SDDocumentReason        : String;
+    TotalNetAmount          : String;
+    TransactionCurrency     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type CreditMemoResult {
@@ -102,7 +105,7 @@ service ReturnsService {
     TotalNetAmount          : String;
     TransactionCurrency     : String;
     OverallSDProcessStatus  : String;
-  sapDocumentVersion : String;
+    sapDocumentVersion      : String;
   };
 
   type ReleaseCreditMemoResult {
@@ -124,6 +127,45 @@ service ReturnsService {
     requiredApprover : String;
   };
 
+  type ParsedComplaint {
+    invoiceNumber   : String;
+    invoiceItem     : String;
+    material        : String;
+    quantity        : Decimal;
+    unit            : String;
+    claimedAmount   : Decimal;
+    soldToParty     : String;
+    proposedAction  : String;
+    reason          : String;
+    ![from]         : String;
+  };
+
+  type ComplaintResult {
+    inboundEmailID   : UUID;
+    status           : String;   // 'LOGGED', 'NEEDS_REVIEW', 'FAILED'
+    statusReason     : String;
+    auditLogID       : UUID;
+    rule             : String;
+    proposedAction   : String;
+    reasoning        : String;
+    creditValue      : Decimal;
+    requiredApprover : String;
+    invoiceNumber    : String;
+    invoiceItem      : String;
+    material         : String;
+    quantity         : Decimal;
+    claimedAmount    : Decimal;
+    soldToParty      : String;
+  };
+
+  type PollResult {
+    processed   : Integer;
+    logged      : Integer;
+    needsReview : Integer;
+    failed      : Integer;
+    ignored     : Integer;
+  };
+
   type PriceCheckResult {
     invoicedPrice  : Decimal;
     agreedPrice    : Decimal;
@@ -140,7 +182,9 @@ service ReturnsService {
     claimedQuantity: Decimal,
     claimedAmount: Decimal,
     creditValue: Decimal,
-    evidenceUrl: String
+    evidenceUrl: String,
+    invoiceItem: String,
+    material: String
   ) returns AuditLog;
 
   action setApprovalStatus(
@@ -153,6 +197,22 @@ service ReturnsService {
   action confirmSpecialAgreement(
     ID: UUID
   ) returns AuditLog;
+
+  // ---------- Complaint intake (front end / agent) ----------
+  action parseComplaint(subject: String, text: String, ![from]: String) returns ParsedComplaint;
+  action processComplaint(subject: String, text: String, ![from]: String) returns ComplaintResult;
+  // Re-run a NEEDS_REVIEW / FAILED complaint with corrected data (e.g. supplied by the agent)
+  action reprocessInboundEmail(
+    ID: UUID,
+    invoiceNumber: String,
+    invoiceItem: String,
+    material: String,
+    quantity: Decimal,
+    claimedAmount: Decimal,
+    soldToParty: String,
+    reason: String
+  ) returns ComplaintResult;
+  action pollInbox() returns PollResult;
 
   // ---------- Read ----------
   function getInvoice(invoiceNumber: String) returns Invoice;

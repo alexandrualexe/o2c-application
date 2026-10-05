@@ -29,6 +29,27 @@ entity ReturnAuditLog : cuid, managed {
   agreementApproved     : Boolean default false; // R4: special agreement confirmed by approver
 }
 
+// Every complaint received by email or submitted via processComplaint
+entity InboundEmail : cuid, managed {
+  messageId             : String;    // Email Message-ID, used to avoid double processing
+  fromAddress           : String;
+  subject               : String;
+  body                  : LargeString;
+  status                : String;    // 'LOGGED', 'NEEDS_REVIEW', 'FAILED'
+  statusReason          : String;    // Why it needs review or failed
+  attempts              : Integer default 0; // Failed processing attempts (SAP unavailable etc.)
+  invoiceNumber         : String;
+  invoiceItem           : String;
+  material              : String;
+  quantity              : Decimal;
+  unit                  : String;
+  claimedAmount         : Decimal;
+  soldToParty           : String;
+  reason                : String;
+  rule                  : String;    // Rule proposed by proposeAction, if any
+  auditLog              : Association to ReturnAuditLog; // Set once logged
+}
+
 entity Customer : cuid {
   soldToParty      : String;
   name             : String;
