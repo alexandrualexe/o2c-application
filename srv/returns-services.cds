@@ -47,7 +47,6 @@ service ReturnsService {
     OverallSDProcessStatus  : String;
   };
 
-  // ---------- Result types ----------
   type ExistingCreditsResult {
     existingReturns : many ReturnItem;
     existingCredits : many CreditMemoRequestHeader;
@@ -108,9 +107,49 @@ service ReturnsService {
     status           : String;
   };
 
+  type ReleaseReturnResult {
+    returnDocumentNumber : String;
+    status               : String;
+  };
+
+  type ProposalResult {
+    rule             : String;
+    proposedAction   : String;
+    reasoning        : String;
+    creditValue      : Decimal;
+    requiresApproval : Boolean;
+    requiredApprover : String;
+  };
+
+  type PriceCheckResult {
+    invoicedPrice  : Decimal;
+    agreedPrice    : Decimal;
+    overcharged    : Boolean;
+    creditAmount   : Decimal;
+  };
+
   // ---------- Audit log ----------
-  action logRequest(invoiceNumber: String, proposedAction: String) returns AuditLog;
-  action setApprovalStatus(ID: UUID, status: String) returns AuditLog;
+  action logRequest(
+    invoiceNumber: String, 
+    proposedAction: String, 
+    rule: String, 
+    reason: String,
+    claimedQuantity: Decimal,
+    claimedAmount: Decimal,
+    creditValue: Decimal,
+    evidenceUrl: String
+  ) returns AuditLog;
+
+  action setApprovalStatus(
+    ID: UUID, 
+    status: String,
+    approvedBy: String,
+    approverRole: String
+  ) returns AuditLog;
+
+  action confirmSpecialAgreement(
+    ID: UUID
+  ) returns AuditLog;
 
   // ---------- Read ----------
   function getInvoice(invoiceNumber: String) returns Invoice;
@@ -118,9 +157,32 @@ service ReturnsService {
   function findInvoices(soldToParty: String, material: String, fromDate: String, toDate: String) returns FindInvoicesResult;
   function getAgreedPrice(soldToParty: String, material: String, salesOrganization: String, distributionChannel: String) returns AgreedPriceResult;
   function getReturnStatus(returnDocumentNumber: String) returns ReturnStatusResult;
+  function proposeAction(invoiceNumber: String, invoiceItem: String, material: String, quantity: Decimal, claimedAmount: Decimal, reason: String, soldToParty: String) returns ProposalResult;
+  function checkPrice(invoicedPrice: Decimal, agreedPrice: Decimal, quantity: Decimal) returns PriceCheckResult;
 
   // ---------- Write ----------
-  action createReturn(invoiceNumber: String, invoiceItem: String, material: String, quantity: String, unit: String, reason: String, soldToParty: String) returns CreateReturnResult;
-  action createCreditMemoRequest(invoiceNumber: String, material: String, quantity: String, unit: String, reason: String, soldToParty: String) returns CreditMemoResult;
+  action createReturn(
+    invoiceNumber: String, 
+    invoiceItem: String, 
+    material: String, 
+    quantity: String, 
+    unit: String, 
+    rule: String,
+    soldToParty: String,
+    creditValue: Decimal
+  ) returns CreateReturnResult;
+
+  action createCreditMemoRequest(
+    invoiceNumber: String, 
+    material: String, 
+    quantity: String, 
+    unit: String, 
+    rule: String,
+    soldToParty: String,
+    creditValue: Decimal,
+    evidenceUrl: String
+  ) returns CreditMemoResult;
+
   action releaseCreditMemoRequest(creditMemoNumber: String, versionStamp: String) returns ReleaseCreditMemoResult;
+  action releaseCustomerReturn(returnDocumentNumber: String, versionStamp: String) returns ReleaseReturnResult;
 }
