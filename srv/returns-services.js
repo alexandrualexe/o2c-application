@@ -711,6 +711,7 @@ module.exports = function (srv) {
     const {
       auditLogID,
       invoiceNumber,
+      invoiceItem,
       material,
       quantity,
       unit,
@@ -722,6 +723,10 @@ module.exports = function (srv) {
 
     if (!auditLogID) {
       return req.reject(400, 'auditLogID is required');
+    }
+
+    if (typeof invoiceItem !== 'string' || !/^\d{1,6}$/.test(invoiceItem)) {
+      return req.reject(400, 'invoiceItem must be the numeric item number from the invoice (1-6 digits)');
     }
 
     // Validate rule is CREDIT type
@@ -781,7 +786,7 @@ module.exports = function (srv) {
 
       // CHANGE 4: Set Cust. Reference to COMPLAINT-<invoice> only (removed rule and UUID suffix)
       const payload = {
-        SalesDocumentType: 'YCR',
+        CreditMemoRequestType: 'YCR',
         SalesOrganization: 'YSOD',
         DistributionChannel: 'Y1',
         OrganizationDivision: 'Y5',
@@ -793,7 +798,8 @@ module.exports = function (srv) {
           Material: material,
           RequestedQuantity: quantity,
           RequestedQuantityUnit: unit,
-          ReferenceSDDocument: invoiceNumber
+          ReferenceSDDocument: invoiceNumber,
+          ReferenceSDDocumentItem: invoiceItem
         }]
       };
 

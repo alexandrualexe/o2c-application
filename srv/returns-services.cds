@@ -179,6 +179,7 @@ service ReturnsService {
   action createCreditMemoRequest(
     auditLogID: UUID,
     invoiceNumber: String, 
+    invoiceItem: String,
     material: String, 
     quantity: String, 
     unit: String, 
