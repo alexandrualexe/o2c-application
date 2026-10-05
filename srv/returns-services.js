@@ -10,7 +10,7 @@ const RULES = {
     proposedAction: 'RETURN',
     sdDocumentType: 'YRE',
     orderReason: '102',
-    description: 'Goods damaged in transit',
+    description: 'Goods damaged in transit (recoverable)',
     creditAfterReceipt: true,
     requiresEvidence: false
   },
@@ -26,7 +26,7 @@ const RULES = {
     proposedAction: 'CREDIT',
     sdDocumentType: 'YCR',
     orderReason: '104',
-    description: 'Goods ruined, credit only',
+    description: 'Goods ruined, credit only (non-recoverable)',
     creditAfterReceipt: false,
     requiresEvidence: true,
     creditManager: true
@@ -47,7 +47,7 @@ const RULES = {
     orderReason: '103',
     description: 'Short delivery',
     creditAfterReceipt: false,
-    requiresEvidence: false,
+    requiresEvidence: true,
     creditManager: true,
     requiresWarehouseCheck: true
   },
@@ -79,7 +79,7 @@ const RULES = {
     proposedAction: 'PENDING',
     sdDocumentType: null,
     orderReason: null,
-    description: 'Invoice not named, search needed',
+    description: 'Invoice not named or found, search needed',
     creditAfterReceipt: false,
     requiresEvidence: false
   }
@@ -166,7 +166,7 @@ module.exports = function (srv) {
         return {
           rule: 'R9',
           proposedAction: 'PENDING',
-          reasoning: 'Invoice not found. Use findInvoices to search.',
+          reasoning: 'Invoice not found. Use findInvoices to search for alternatives.',
           creditValue: 0,
           requiresApproval: false,
           requiredApprover: null
@@ -182,7 +182,7 @@ module.exports = function (srv) {
         return {
           rule: 'R9',
           proposedAction: 'PENDING',
-          reasoning: 'Line item not found. Searching for matching invoices.',
+          reasoning: 'Line item not found. Please verify invoice and material number.',
           creditValue: 0,
           requiresApproval: false,
           requiredApprover: null
@@ -191,13 +191,14 @@ module.exports = function (srv) {
 
       const invoicedQty = parseFloat(lineItem.BillingQuantity) || 0;
       const invoicedAmount = parseFloat(lineItem.NetAmount) || 0;
+      const invoicedPrice = invoicedQty > 0 ? invoicedAmount / invoicedQty : 0;
 
       // R7: Claimed quantity exceeds invoice
       if (quantity > invoicedQty) {
         return {
           rule: 'R7',
           proposedAction: 'REJECT',
-          reasoning: `Claimed quantity ${quantity} exceeds invoiced ${invoicedQty}. Ask customer to correct.`,
+          reasoning: `Claimed quantity ${quantity} ${lineItem.BillingQuantityUnit} exceeds invoiced ${invoicedQty}. Ask customer to verify.`,
           creditValue: 0,
           requiresApproval: true,
           requiredApprover: 'customer-service-lead'
@@ -208,115 +209,168 @@ module.exports = function (srv) {
         return {
           rule: 'R7',
           proposedAction: 'REJECT',
-          reasoning: `Claimed amount ${claimedAmount} exceeds invoiced ${invoicedAmount}. Ask customer to correct.`,
+          reasoning: `Claimed amount ${claimedAmount} exceeds invoiced ${invoicedAmount}. Ask customer to verify.`,
           creditValue: 0,
           requiresApproval: true,
           requiredApprover: 'customer-service-lead'
         };
       }
 
-      // R8: Check for existing complaints
+      // R8: Check for existing approved complaints
       const tx = cds.tx(req);
       const existingApproved = await tx.run(
         SELECT.one.from(AuditLog).where({
           invoiceNumber,
-          approvalStatus: 'APPROVED'
+          approvalStatus: 'APPROVED',
+          sapDocument: { '!=': null }
         })
       );
 
-      if (existingApproved && existingApproved.sapDocument) {
+      if (existingApproved) {
         return {
           rule: 'R8',
           proposedAction: 'REJECT',
-          reasoning: `Duplicate: complaint already handled as ${existingApproved.sapDocumentType} ${existingApproved.sapDocument} under rule ${existingApproved.rule}.`,
+          reasoning: `Duplicate: ${existingApproved.sapDocumentType} ${existingApproved.sapDocument} already exists for invoice ${invoiceNumber} under rule ${existingApproved.rule}.`,
           creditValue: 0,
           requiresApproval: false,
           requiredApprover: null
         };
       }
 
-      // If reason mentions damage/transit -> R1 (default for damaged goods)
+      // Also check SAP for existing returns/credit memos
+      try {
+        const existingCreds = await tx.send('checkExistingCredits', { invoiceNumber });
+        if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
+          const existing = existingCreds.existingReturns?.[0] || existingCreds.existingCredits?.[0];
+          return {
+            rule: 'R8',
+            proposedAction: 'REJECT',
+            reasoning: `Duplicate in SAP: ${existing.CustomerReturn || existing.CreditMemoRequest} already exists for this invoice.`,
+            creditValue: 0,
+            requiresApproval: false,
+            requiredApprover: null
+          };
+        }
+      } catch (err) {
+        console.warn('checkExistingCredits failed (non-fatal):', err.message);
+      }
+
+      // Normalize reason to lowercase for keyword matching
       const lowerReason = (reason || '').toLowerCase();
-      if (lowerReason.includes('damage') || lowerReason.includes('transit')) {
-        const creditValue = quantity * (invoicedAmount / invoicedQty);
-        const requiredApprover = getRequiredApprover(creditValue, 'R1');
+
+      // ---- RULE PRECEDENCE ----
+      // R3 must come BEFORE R1 because "damaged and leaking" should be R3, not R1
+
+      // R3: Irrecoverable goods (ruined, leaking, contaminated)
+      if (lowerReason.includes('ruined') || lowerReason.includes('leak') || lowerReason.includes('contaminat')) {
+        const creditValue = quantity > 0 ? quantity * invoicedPrice : invoicedAmount;
+        return {
+          rule: 'R3',
+          proposedAction: 'CREDIT',
+          reasoning: `${RULES.R3.description}. Credit only, no return. Requires photo/evidence of damage.`,
+          creditValue,
+          requiresApproval: true,
+          requiredApprover: 'credit-manager'
+        };
+      }
+
+      // R1: Recoverable goods damaged in transit
+      if (lowerReason.includes('damage') || lowerReason.includes('transit') || lowerReason.includes('broken')) {
+        const creditValue = quantity > 0 ? quantity * invoicedPrice : invoicedAmount;
         return {
           rule: 'R1',
           proposedAction: 'RETURN',
           reasoning: `${RULES.R1.description}. Return the goods; credit after warehouse receipt.`,
           creditValue,
           requiresApproval: true,
-          requiredApprover
+          requiredApprover: getRequiredApprover(creditValue, 'R1')
         };
       }
 
-      // If reason mentions quality/defect -> R2
-      if (lowerReason.includes('quality') || lowerReason.includes('defect')) {
-        const creditValue = quantity * (invoicedAmount / invoicedQty);
-        const requiredApprover = getRequiredApprover(creditValue, 'R2');
+      // R2: Quality/defect issues
+      if (lowerReason.includes('quality') || lowerReason.includes('defect') || lowerReason.includes('faulty')) {
+        const creditValue = quantity > 0 ? quantity * invoicedPrice : invoicedAmount;
         return {
           rule: 'R2',
           proposedAction: 'RETURN',
           reasoning: `${RULES.R2.description}. Return the goods; credit after warehouse receipt.`,
           creditValue,
           requiresApproval: true,
-          requiredApprover
+          requiredApprover: getRequiredApprover(creditValue, 'R2')
         };
       }
 
-      // If reason mentions ruined/leaked/contaminated -> R3
-      if (lowerReason.includes('ruined') || lowerReason.includes('leak') || lowerReason.includes('contaminat')) {
-        const creditValue = quantity * (invoicedAmount / invoicedQty);
-        return {
-          rule: 'R3',
-          proposedAction: 'CREDIT',
-          reasoning: `${RULES.R3.description}. Credit only, no return. Requires photo evidence.`,
-          creditValue,
-          requiresApproval: true,
-          requiredApprover: 'credit-manager'
-        };
+      // R4: Price overcharge (requires PR00 verification)
+      if (lowerReason.includes('price') || lowerReason.includes('expensive') || lowerReason.includes('overcharg')) {
+        // Query agreed price from SAP PR00 condition
+        let agreedPrice = invoicedPrice; // Default to invoiced price
+        try {
+          const priceResult = await tx.send('getAgreedPrice', {
+            soldToParty: soldToParty || '',
+            material: material || '',
+            salesOrganization: invoice.SalesOrganization,
+            distributionChannel: invoice.DistributionChannel
+          });
+          
+          if (priceResult.agreedPrices?.length > 0) {
+            agreedPrice = parseFloat(priceResult.agreedPrices[0].ConditionRateValue) || invoicedPrice;
+          }
+        } catch (err) {
+          console.warn('getAgreedPrice failed:', err.message);
+        }
+
+        // Detect overcharge
+        if (invoicedPrice > agreedPrice) {
+          const creditAmount = (invoicedPrice - agreedPrice) * quantity;
+          return {
+            rule: 'R4',
+            proposedAction: 'CREDIT',
+            reasoning: `${RULES.R4.description}. Invoice: ${invoicedPrice}/unit, Agreed: ${agreedPrice}/unit. Requires special agreement confirmation.`,
+            creditValue: creditAmount,
+            requiresApproval: true,
+            requiredApprover: 'credit-manager'
+          };
+        } else {
+          // No overcharge detected
+          return {
+            rule: 'R4',
+            proposedAction: 'REJECT',
+            reasoning: `Price claim not supported. Invoiced price (${invoicedPrice}/unit) matches agreed price (${agreedPrice}/unit).`,
+            creditValue: 0,
+            requiresApproval: true,
+            requiredApprover: 'credit-manager'
+          };
+        }
       }
 
-      // If reason mentions price/expensive -> R4
-      if (lowerReason.includes('price') || lowerReason.includes('expensive')) {
-        // This is a placeholder; R4 needs actual price comparison
-        const creditValue = claimedAmount;
-        return {
-          rule: 'R4',
-          proposedAction: 'CREDIT',
-          reasoning: `${RULES.R4.description}. Needs price verification (PR00) and special agreement.`,
-          creditValue,
-          requiresApproval: true,
-          requiredApprover: 'credit-manager'
-        };
-      }
-
-      // If reason mentions short/missing -> R5
-      if (lowerReason.includes('short') || lowerReason.includes('missing')) {
-        const creditValue = quantity * (invoicedAmount / invoicedQty);
+      // R5: Short delivery (quantity billed < ordered quantity)
+      if (lowerReason.includes('short') || lowerReason.includes('missing') || lowerReason.includes('incomplete')) {
+        // For now, assume claimed quantity < invoiced quantity means short delivery
+        // In production, compare against original sales order
+        const creditValue = quantity > 0 ? quantity * invoicedPrice : invoicedAmount;
         return {
           rule: 'R5',
           proposedAction: 'CREDIT',
-          reasoning: `${RULES.R5.description}. Credit and request warehouse to check proof of delivery.`,
+          reasoning: `${RULES.R5.description}. Claimed ${quantity}, invoiced ${invoicedQty}. Requires warehouse confirmation or proof of delivery.`,
           creditValue,
           requiresApproval: true,
           requiredApprover: 'credit-manager'
         };
       }
 
-      // If reason mentions replace/replacement -> R6
-      if (lowerReason.includes('replace') || lowerReason.includes('substitute')) {
+      // R6: Replacement request (hand to customer service, no SAP document)
+      if (lowerReason.includes('replace') || lowerReason.includes('substitut') || lowerReason.includes('send another')) {
         return {
           rule: 'R6',
           proposedAction: 'REPLACEMENT',
-          reasoning: `${RULES.R6.description}. No SAP document; escalate to customer service.`,
+          reasoning: `${RULES.R6.description}. Escalate to customer service for replacement logistics.`,
           creditValue: 0,
           requiresApproval: true,
           requiredApprover: 'customer-service-lead'
         };
       }
 
-      // Default: ask for clarification
+      // R9: Reason unclear or unmatched
       return {
         rule: 'R9',
         proposedAction: 'PENDING',
@@ -524,6 +578,7 @@ module.exports = function (srv) {
   // ---- createReturn: R1, R2 - return goods and block for credit after receipt ----
   srv.on('createReturn', async (req) => {
     const {
+      auditLogID,
       invoiceNumber,
       invoiceItem,
       material,
@@ -534,21 +589,41 @@ module.exports = function (srv) {
       creditValue
     } = req.data;
 
+    if (!auditLogID) {
+      return req.reject(400, 'auditLogID is required');
+    }
+
     // Validate rule is RETURN type
     if (!rule || RULES[rule]?.sdDocumentType !== 'YRE') {
       return req.reject(400, `Rule ${rule} is not a RETURN rule (R1 or R2)`);
     }
 
-    // Check for duplicate (R8)
     const tx = cds.tx(req);
+
+    // Re-read the audit entry and verify it's approved
+    const auditLog = await tx.run(SELECT.one.from(AuditLog).where({ ID: auditLogID }));
+    if (!auditLog) {
+      return req.reject(404, `Audit log ${auditLogID} not found`);
+    }
+
+    if (auditLog.approvalStatus !== 'APPROVED') {
+      return req.reject(400, `Audit log must be APPROVED before document creation`);
+    }
+
+    if (auditLog.sapDocument) {
+      return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
+    }
+
+    // Check for duplicate in SAP
     const existing = await tx.run(
       SELECT.one.from(AuditLog).where({
         invoiceNumber,
         rule: { in: ['R1', 'R2'] },
-        approvalStatus: 'APPROVED'
+        approvalStatus: 'APPROVED',
+        sapDocument: { '!=': null }
       })
     );
-    if (existing && existing.sapDocument) {
+    if (existing && existing.ID !== auditLogID) {
       return req.reject(409, `Return already exists: ${existing.sapDocument} for rule ${existing.rule}`);
     }
 
@@ -565,7 +640,7 @@ module.exports = function (srv) {
         OrganizationDivision: 'Y5',
         SoldToParty: soldToParty,
         SDDocumentReason: orderReason,
-        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}`,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}-${auditLogID.substring(0, 8)}`,
         HeaderBillingBlockReason: '08', // Billing block: Check Credit Memo
         to_Item: [{
           Material: material,
@@ -596,9 +671,9 @@ module.exports = function (srv) {
           .set({
             sapDocument: returnDoc.CustomerReturn,
             sapDocumentType: 'YRE',
-            sapDocumentVersion: returnDoc.__metadata?.version
+            sapDocumentVersion: returnDoc.__metadata?.version || returnDoc.version
           })
-          .where({ invoiceNumber, rule })
+          .where({ ID: auditLogID })
       );
 
       return returnDoc;
@@ -610,6 +685,7 @@ module.exports = function (srv) {
   // ---- createCreditMemoRequest: R3, R4, R5 - credit without or before goods return ----
   srv.on('createCreditMemoRequest', async (req) => {
     const {
+      auditLogID,
       invoiceNumber,
       material,
       quantity,
@@ -620,9 +696,29 @@ module.exports = function (srv) {
       evidenceUrl
     } = req.data;
 
+    if (!auditLogID) {
+      return req.reject(400, 'auditLogID is required');
+    }
+
     // Validate rule is CREDIT type
     if (!rule || RULES[rule]?.sdDocumentType !== 'YCR') {
       return req.reject(400, `Rule ${rule} is not a CREDIT rule (R3, R4, or R5)`);
+    }
+
+    const tx = cds.tx(req);
+
+    // Re-read the audit entry and verify it's approved
+    const auditLog = await tx.run(SELECT.one.from(AuditLog).where({ ID: auditLogID }));
+    if (!auditLog) {
+      return req.reject(404, `Audit log ${auditLogID} not found`);
+    }
+
+    if (auditLog.approvalStatus !== 'APPROVED') {
+      return req.reject(400, `Audit log must be APPROVED before document creation`);
+    }
+
+    if (auditLog.sapDocument) {
+      return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
     }
 
     // R3 requires evidence
@@ -636,25 +732,20 @@ module.exports = function (srv) {
     }
 
     // R4 requires special agreement to be confirmed
-    const tx = cds.tx(req);
-    if (rule === 'R4') {
-      const auditLog = await tx.run(
-        SELECT.one.from(AuditLog).where({ invoiceNumber, rule: 'R4', approvalStatus: 'APPROVED' })
-      );
-      if (!auditLog || !auditLog.agreementApproved) {
-        return req.reject(400, 'Rule R4 requires special agreement to be confirmed via confirmSpecialAgreement');
-      }
+    if (rule === 'R4' && !auditLog.agreementApproved) {
+      return req.reject(400, 'Rule R4 requires special agreement to be confirmed via confirmSpecialAgreement');
     }
 
-    // Check for duplicate (R8)
+    // Check for duplicate in SAP
     const existing = await tx.run(
       SELECT.one.from(AuditLog).where({
         invoiceNumber,
         rule: { in: ['R3', 'R4', 'R5'] },
-        approvalStatus: 'APPROVED'
+        approvalStatus: 'APPROVED',
+        sapDocument: { '!=': null }
       })
     );
-    if (existing && existing.sapDocument) {
+    if (existing && existing.ID !== auditLogID) {
       return req.reject(409, `Credit memo already exists: ${existing.sapDocument} for rule ${existing.rule}`);
     }
 
@@ -671,7 +762,7 @@ module.exports = function (srv) {
         OrganizationDivision: 'Y5',
         SoldToParty: soldToParty,
         SDDocumentReason: orderReason,
-        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}`,
+        PurchaseOrderByCustomer: `COMPLAINT-${invoiceNumber}-${rule}-${auditLogID.substring(0, 8)}`,
         HeaderBillingBlockReason: '08', // Billing block: Check Credit Memo
         to_Item: [{
           Material: material,
@@ -701,10 +792,10 @@ module.exports = function (srv) {
           .set({
             sapDocument: creditDoc.CreditMemoRequest,
             sapDocumentType: 'YCR',
-            sapDocumentVersion: creditDoc.__metadata?.version,
+            sapDocumentVersion: creditDoc.__metadata?.version || creditDoc.version,
             warehouseCheckNeeded: rule === 'R5'
           })
-          .where({ invoiceNumber, rule })
+          .where({ ID: auditLogID })
       );
 
       return creditDoc;
@@ -788,7 +879,7 @@ module.exports = function (srv) {
     }
   });
 
-  // ---- getReturnStatus: check if goods were received (needed for R1, R2 auto-credit) ----
+  // ---- getReturnStatus: check if goods were received (for audit trail) ----
   srv.on('getReturnStatus', async (req) => {
     const { returnDocumentNumber } = req.data;
     if (!returnDocumentNumber) {
@@ -801,27 +892,6 @@ module.exports = function (srv) {
       );
       const returnData = unwrap(response.data);
       const received = returnData.WarehouseReceiptStatus === 'C';
-
-      // If goods received and R1/R2, auto-create credit memo
-      if (received) {
-        const tx = cds.tx(req);
-        const audit = await tx.run(
-          SELECT.one.from(AuditLog).where({
-            sapDocument: returnDocumentNumber,
-            rule: { in: ['R1', 'R2'] }
-          })
-        );
-
-        if (audit && !audit.autoCreatedCreditMemo) {
-          // Mark that we initiated auto-credit
-          await tx.run(
-            UPDATE(AuditLog)
-              .set({ autoCreatedCreditMemo: 'PENDING' })
-              .where({ ID: audit.ID })
-          );
-          console.log(`Auto-credit triggered for return ${returnDocumentNumber}, audit ${audit.ID}`);
-        }
-      }
 
       return {
         returnDocumentNumber,

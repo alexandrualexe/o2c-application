@@ -162,6 +162,7 @@ service ReturnsService {
 
   // ---------- Write ----------
   action createReturn(
+    auditLogID: UUID,
     invoiceNumber: String, 
     invoiceItem: String, 
     material: String, 
@@ -173,6 +174,7 @@ service ReturnsService {
   ) returns CreateReturnResult;
 
   action createCreditMemoRequest(
+    auditLogID: UUID,
     invoiceNumber: String, 
     material: String, 
     quantity: String, 
