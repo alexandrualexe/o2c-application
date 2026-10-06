@@ -127,19 +127,17 @@ const RULES = {
 //   up to 500 EUR   -> customer-service-lead
 //   up to 5000 EUR  -> credit-manager
 //   above           -> finance-director
+// R3, R4, R5 need at least a credit manager, but above 5000 EUR they also go
+// to the finance director like any other credit.
 // A higher role may always approve on behalf of a lower one (see setApprovalStatus).
 function getRequiredApprover(creditValue, rule) {
   const ruleData = RULES[rule] || {};
 
+  if (creditValue > 5000) return 'finance-director';
   // R3, R4, R5 always need at least credit manager (no goods back, or special handling)
-  if (ruleData.creditManager) {
-    return 'credit-manager';
-  }
-
-  // R1, R2: tier by value
+  if (ruleData.creditManager) return 'credit-manager';
   if (creditValue <= 500) return 'customer-service-lead';
-  if (creditValue <= 5000) return 'credit-manager';
-  return 'finance-director';
+  return 'credit-manager';
 }
 
 // Generic request helper: every SAP call goes through the DS4 destination and
@@ -237,6 +235,9 @@ function approvalMismatch(auditLog, { invoiceNumber, rule }) {
 // CAP calls this with the ReturnsService instance; all handlers are registered here
 module.exports = function (srv) {
   const { AuditLog } = srv.entities;
+
+  // Read-only functions for the Reclaim Control Tower (srv/control-tower.js)
+  require('./control-tower')(srv, { callDestination, handleError, unwrap });
 
   // ---- proposeAction: R1-R9 decision tree ----
   // Reads the invoice from SAP and decides which rule applies. Order of checks:
@@ -378,7 +379,7 @@ module.exports = function (srv) {
           reasoning: `${RULES.R3.description}. Credit only, no return. Requires photo/evidence of damage.`,
           creditValue,
           requiresApproval: true,
-          requiredApprover: 'credit-manager'
+          requiredApprover: getRequiredApprover(creditValue, 'R3')
         };
       }
 
@@ -412,10 +413,12 @@ module.exports = function (srv) {
       // Compares the invoiced unit price with the agreed PR00 price in SAP
       if (lowerReason.includes('price') || lowerReason.includes('expensive') || lowerReason.includes('overcharg')) {
         // Query agreed price from SAP PR00 condition
+        // The customer comes from the invoice (the agreement is with the billed customer);
+        // the soldToParty parameter is only a fallback, so the lookup also works without it.
         let agreedPrice = invoicedPrice; // Default to invoiced price
         try {
           const priceResult = await srv.send('getAgreedPrice', {
-            soldToParty: soldToParty || '',
+            soldToParty: invoice.SoldToParty || soldToParty || '',
             material: material || '',
             salesOrganization: invoice.SalesOrganization,
             distributionChannel: invoice.DistributionChannel
@@ -425,7 +428,7 @@ module.exports = function (srv) {
             agreedPrice = parseFloat(priceResult.agreedPrices[0].ConditionRateValue) || invoicedPrice;
           }
         } catch (err) {
-          // e.g. missing soldToParty: keep agreedPrice = invoicedPrice (no overcharge detected)
+          // e.g. SAP unreachable: keep agreedPrice = invoicedPrice (no overcharge detected)
           console.warn('getAgreedPrice failed:', err.message);
         }
 
@@ -439,7 +442,7 @@ module.exports = function (srv) {
             reasoning: `${RULES.R4.description}. Invoice: ${invoicedPrice}/unit, Agreed: ${agreedPrice}/unit. Requires special agreement confirmation.`,
             creditValue: creditAmount,
             requiresApproval: true,
-            requiredApprover: 'credit-manager'
+            requiredApprover: getRequiredApprover(creditAmount, 'R4')
           };
         } else {
           // No overcharge detected
@@ -465,7 +468,7 @@ module.exports = function (srv) {
           reasoning: `${RULES.R5.description}. Claimed ${quantity}, invoiced ${invoicedQty}. Requires warehouse confirmation or proof of delivery.`,
           creditValue,
           requiresApproval: true,
-          requiredApprover: 'credit-manager'
+          requiredApprover: getRequiredApprover(creditValue, 'R5')
         };
       }
 

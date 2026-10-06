@@ -283,3 +283,54 @@ describe('6. invoiceNumber is validated before it goes into OData URLs', () => {
     expect((await propose({ reason: 'defective' })).rule).toBe('R2');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Approval tiers: R3/R4/R5 need at least a credit manager, and above 5000 EUR
+// the finance director, like any other credit
+describe('Approval tiers for credit-only rules', () => {
+  // Line becomes 10 PC for 60000.00, so 2 PC = 12000 EUR
+  const bigLine = () => { sap.invoices['90000123'].to_Item.results[0].NetAmount = '60000.00'; };
+
+  test.each([
+    ['ruined', 'R3'],
+    ['short delivery', 'R5']
+  ])('%s above 5000 EUR -> finance director', async (reason, rule) => {
+    bigLine();
+    expect(await propose({ reason })).toMatchObject({ rule, creditValue: 12000, requiredApprover: 'finance-director' });
+  });
+
+  test('small R3/R5 credits still need a credit manager', async () => {
+    expect(await propose({ reason: 'ruined' })).toMatchObject({ rule: 'R3', creditValue: 20, requiredApprover: 'credit-manager' });
+    expect(await propose({ reason: 'short delivery' })).toMatchObject({ rule: 'R5', requiredApprover: 'credit-manager' });
+  });
+
+  test('logRequest uses the same tiers', async () => {
+    const entry = await srv.send('logRequest', {
+      invoiceNumber: '90000123', proposedAction: 'CREDIT', rule: 'R3', reason: 'ruined',
+      claimedQuantity: 2, claimedAmount: 0, creditValue: 12000, evidenceUrl: 'https://photo'
+    });
+    expect(entry.requiredApprover).toBe('finance-director');
+  });
+
+  test('a credit manager cannot approve a large R3 credit', async () => {
+    const entry = await srv.send('logRequest', {
+      invoiceNumber: '90000123', proposedAction: 'CREDIT', rule: 'R3', reason: 'ruined',
+      claimedQuantity: 2, claimedAmount: 0, creditValue: 12000, evidenceUrl: 'https://photo'
+    });
+    await expect(srv.send('setApprovalStatus', {
+      ID: entry.ID, status: 'APPROVED', approvedBy: 'u1', approverRole: 'credit-manager'
+    })).rejects.toMatchObject({ code: 403 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4: the agreed price is looked up for the invoice's customer, so it also
+// works when the complaint did not name the customer
+describe('R4 price lookup without soldToParty', () => {
+  test('uses the sold-to party from the invoice', async () => {
+    await propose({ reason: 'wrong price', soldToParty: '' });
+    const lookup = sap.calls.find((c) => c.url.includes('A_SlsPrcgCndnRecdValidity'));
+    expect(lookup).toBeDefined();
+    expect(decodeURIComponent(lookup.url)).toContain("SoldToParty eq '100001'");
+  });
+});

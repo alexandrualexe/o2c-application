@@ -221,6 +221,28 @@ service ReturnsService {
   // Pure calculation helper for price disputes
   function checkPrice(invoicedPrice: Decimal, agreedPrice: Decimal, quantity: Decimal) returns PriceCheckResult;
 
+  // ---------- Control Tower (read-only) ----------
+  // Functions (GET) for the Reclaim Control Tower, implemented in
+  // srv/control-tower.js. Each returns a JSON string
+  //   { underlyingRequests: [...SAP GETs], capturedOn: 'YYYY-MM-DD', response: {...} }
+  // so the OData answer is { "value": "<json>" }. Deliberately no actions here:
+  // the Control Tower has no write path.
+
+  // Goods issued but not (fully) billed; top 1..500 (default 500)
+  function listUnbilledDeliveries(top: Integer, soldToParty: String) returns LargeString;
+  // Goods issued more than 3 days ago without proof of delivery
+  function listDeliveriesAwaitingPod(top: Integer, shipToParty: String) returns LargeString;
+  // Sales orders with billing block, delivery block or credit block
+  function listBlockedOrders(top: Integer) returns LargeString;
+  // Overdue open items per customer for one company code; keyDate YYYY-MM-DD (default today)
+  function listOverdueReceivables(companyCode: String, keyDate: String) returns LargeString;
+  // Billing due list for one customer; top default 100
+  function listBillingDueList(soldToParty: String, top: Integer) returns LargeString;
+  // Country, city and name for comma-separated business partners, plus all Norway addresses
+  function getCustomerAddresses(partners: String) returns LargeString;
+  // Sales order -> delivery -> billing conformance check
+  function checkOrderConformance(salesOrder: String) returns LargeString;
+
   // ---------- Write ----------
   // Actions that create or change documents in SAP. Each one requires an
   // APPROVED audit entry that matches the request (invoice, rule, action).
