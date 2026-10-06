@@ -310,21 +310,52 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
       byReference(`${BILLING_PATH}/A_BillingDocumentItem`, 'SalesDocument')
     ]);
 
-    const deliveries = [...new Set(deliveryItems.map((i) => noZeros(i.DeliveryDocument)))];
+    const deliveryKeys = [...new Set(deliveryItems.map((i) => i.DeliveryDocument))];
+    const deliveries = deliveryKeys.map(noZeros);
     const billingDocuments = [...new Set(billingItems.map((i) => noZeros(i.BillingDocument)))];
 
+    // Delivered but not billed: read the POD status, because an open POD is the cause (3.4.1)
+    let podOpen = [];
+    if (deliveryKeys.length && !billingDocuments.length) {
+      const headers = await getAll(trace, `${DELIVERY_PATH}/A_OutbDeliveryHeader`,
+        [['$filter', orFilter('DeliveryDocument', deliveryKeys)],
+          ['$select', 'DeliveryDocument,OverallProofOfDeliveryStatus']], 1000, 1000);
+      podOpen = headers
+        .filter((h) => ['A', 'B'].includes(h.OverallProofOfDeliveryStatus))
+        .map((h) => noZeros(h.DeliveryDocument));
+    }
+
+    // Steps and wording follow the Control Tower's L4 table
+    // (2.3.3 · 4.1.4 -> 3 Block Buster, 3.4.1 -> 6 POD Chaser, 4.1.1 -> 7 Billing Gatekeeper)
     const findings = [];
     if (order.TotalCreditCheckStatus === 'B') {
       findings.push({
         severity: 'medium',
         l4: '2.3.3',
-        step: 'Credit Management: Release sales order blocked by credit check (VKM1)',
-        finding: 'Order is on credit block: delivery and billing cannot proceed.',
+        step: 'Remove billing block upon approval (VKM1)',
+        finding: 'Credit block: needs a credit-limit decision (master data) by a person.',
         routeTo: 'blocks'
       });
     }
-    // No delivery yet means nothing to deviate from; the grace period is applied by Reclaim
-    if (deliveries.length && !billingDocuments.length) {
+    // No delivery yet means nothing to deviate from; the grace period is applied by Reclaim.
+    // One finding per order, by cause: POD open first, then billing block, else billing itself.
+    if (deliveries.length && !billingDocuments.length && podOpen.length) {
+      findings.push({
+        severity: 'high',
+        l4: '3.4.1',
+        step: 'Proof of Delivery: Confirm POD (VLPOD)',
+        finding: `Goods issued, proof of delivery still open (${podOpen.join(', ')}): billing waits for POD.`,
+        routeTo: 'pod'
+      });
+    } else if (deliveries.length && !billingDocuments.length && order.HeaderBillingBlockReason) {
+      findings.push({
+        severity: 'medium',
+        l4: '4.1.4',
+        step: 'Remove billing block (VA02)',
+        finding: `Delivered but billing block ${order.HeaderBillingBlockReason} is set: billing cannot proceed.`,
+        routeTo: 'blocks'
+      });
+    } else if (deliveries.length && !billingDocuments.length) {
       findings.push({
         severity: 'high',
         l4: '4.1.1',

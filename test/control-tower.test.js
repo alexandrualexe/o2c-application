@@ -269,7 +269,57 @@ describe('checkOrderConformance', () => {
   test('credit block -> 2.3.3 finding routed to blocks', async () => {
     routes = { "A_SalesOrder('1876')": order({ TotalCreditCheckStatus: 'B' }) };
     const out = await call("checkOrderConformance(salesOrder='1876')");
-    expect(out.response.findings).toMatchObject([{ l4: '2.3.3', routeTo: 'blocks' }]);
+    expect(out.response.findings).toEqual([{
+      severity: 'medium', l4: '2.3.3',
+      step: 'Remove billing block upon approval (VKM1)',
+      finding: 'Credit block: needs a credit-limit decision (master data) by a person.',
+      routeTo: 'blocks'
+    }]);
+  });
+
+  test('delivered, unbilled and POD open -> one 3.4.1 finding routed to pod', async () => {
+    routes = {
+      "A_SalesOrder('1876')": order({ HeaderBillingBlockReason: '02' }),
+      A_OutbDeliveryItem: [{ DeliveryDocument: '0080000001' }, { DeliveryDocument: '0080000002' }],
+      A_OutbDeliveryHeader: [
+        { DeliveryDocument: '0080000001', OverallProofOfDeliveryStatus: 'A' },
+        { DeliveryDocument: '0080000002', OverallProofOfDeliveryStatus: 'C' }
+      ]
+    };
+    const out = await call("checkOrderConformance(salesOrder='1876')");
+    expect(out.response.findings).toEqual([{
+      severity: 'high', l4: '3.4.1',
+      step: 'Proof of Delivery: Confirm POD (VLPOD)',
+      finding: 'Goods issued, proof of delivery still open (80000001): billing waits for POD.',
+      routeTo: 'pod'
+    }]);
+    expect(out.underlyingRequests.find((r) => r.includes('A_OutbDeliveryHeader'))).toContain(
+      "DeliveryDocument eq '0080000001' or DeliveryDocument eq '0080000002'");
+  });
+
+  test('delivered with billing block, POD done -> 4.1.4 finding routed to blocks', async () => {
+    routes = {
+      "A_SalesOrder('1876')": order({ HeaderBillingBlockReason: '02' }),
+      A_OutbDeliveryItem: [{ DeliveryDocument: '0080000001' }],
+      A_OutbDeliveryHeader: [{ DeliveryDocument: '0080000001', OverallProofOfDeliveryStatus: '' }]
+    };
+    const out = await call("checkOrderConformance(salesOrder='1876')");
+    expect(out.response.findings).toEqual([{
+      severity: 'medium', l4: '4.1.4',
+      step: 'Remove billing block (VA02)',
+      finding: 'Delivered but billing block 02 is set: billing cannot proceed.',
+      routeTo: 'blocks'
+    }]);
+  });
+
+  test('billed order -> POD status is not read', async () => {
+    routes = {
+      "A_SalesOrder('1876')": order(),
+      A_OutbDeliveryItem: [{ DeliveryDocument: '80000001' }],
+      A_BillingDocumentItem: [{ BillingDocument: '90000376' }]
+    };
+    const out = await call("checkOrderConformance(salesOrder='1876')");
+    expect(out.underlyingRequests.some((r) => r.includes('A_OutbDeliveryHeader'))).toBe(false);
   });
 
   test('unknown order -> 404 from SAP', async () => {
