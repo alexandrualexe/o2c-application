@@ -1,10 +1,48 @@
+// =============================================================================
+// ReturnsService implementation (handlers for srv/returns-services.cds)
+// -----------------------------------------------------------------------------
+// The service is the "hands" of the returns agent. It does three things:
+//
+//   1. DECIDE   proposeAction runs the R1–R9 decision tree against the real
+//               invoice in SAP and proposes RETURN / CREDIT / REPLACEMENT /
+//               REJECT / PENDING plus a credit value and an approver tier.
+//   2. CONTROL  logRequest / setApprovalStatus / confirmSpecialAgreement keep
+//               an audit trail in our own database. Nothing is created in SAP
+//               without an APPROVED audit entry that matches the request.
+//   3. ACT      createReturn / createCreditMemoRequest create the SAP document
+//               with billing block 08; release* removes the block afterwards.
+//
+// All SAP calls go through the BTP destination "DS4" (SAP S/4HANA, client 100)
+// via the SAP Cloud SDK, using the standard OData v2 APIs:
+//   API_BILLING_DOCUMENT_SRV         invoices
+//   API_CUSTOMER_RETURN_SRV          customer returns (YRE)
+//   API_CREDIT_MEMO_REQUEST_SRV      credit memo requests (YCR)
+//   API_SLSPRICINGCONDITIONRECORD_SRV  agreed prices (PR00)
+//
+// Rule overview:
+//   R1 damaged in transit   -> RETURN (YRE)   R6 replacement        -> customer service
+//   R2 poor quality/defect  -> RETURN (YRE)   R7 claim > invoice    -> REJECT
+//   R3 ruined, no return    -> CREDIT (YCR)   R8 duplicate          -> REJECT
+//   R4 price above agreed   -> CREDIT (YCR)   R9 unclear/not found  -> PENDING (ask)
+//   R5 short delivery       -> CREDIT (YCR)
+// =============================================================================
+
 const cds = require('@sap/cds');
 const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
 
+// BTP destination pointing to the S/4HANA system, and its SAP client
 const DEST = 'DS4';
 const SAP_CLIENT = '100';
 
 // Rule definitions with all metadata
+//   proposedAction   what proposeAction returns for the rule
+//   sdDocumentType   SAP document created on approval (YRE return, YCR credit memo, null = none)
+//   orderReason      SAP order reason (SDDocumentReason) written to the document
+//   creditAfterReceipt  credit is only given once the goods are back in the warehouse
+//   requiresEvidence    photo (R3) or proof of delivery (R5) needed
+//   creditManager       always needs at least a credit manager, regardless of value
+//   requiresAgreement   R4: special price agreement must be confirmed first
+//   requiresWarehouseCheck  R5: warehouse has to confirm the short delivery
 const RULES = {
   R1: {
     proposedAction: 'RETURN',
@@ -86,21 +124,27 @@ const RULES = {
 };
 
 // Approval tier mapping by credit value and rule
+//   up to 500 EUR   -> customer-service-lead
+//   up to 5000 EUR  -> credit-manager
+//   above           -> finance-director
+// A higher role may always approve on behalf of a lower one (see setApprovalStatus).
 function getRequiredApprover(creditValue, rule) {
   const ruleData = RULES[rule] || {};
-  
+
   // R3, R4, R5 always need at least credit manager (no goods back, or special handling)
   if (ruleData.creditManager) {
     return 'credit-manager';
   }
-  
+
   // R1, R2: tier by value
   if (creditValue <= 500) return 'customer-service-lead';
   if (creditValue <= 5000) return 'credit-manager';
   return 'finance-director';
 }
 
-// Generic request helper
+// Generic request helper: every SAP call goes through the DS4 destination and
+// carries the sap-client header. The destination service supplies URL and auth;
+// the connectivity service tunnels the call to the on-premise system.
 async function callDestination(method, path, payload, extraHeaders = {}) {
   return executeHttpRequest(
     { destinationName: DEST },
@@ -114,6 +158,9 @@ async function callDestination(method, path, payload, extraHeaders = {}) {
 }
 
 // CSRF token + cookies for POST/PATCH calls
+// SAP Gateway rejects modifying requests without a CSRF token. The token is
+// fetched with a GET on the service root and is only valid together with the
+// session cookies of that same response, so both are returned and sent along.
 async function getCsrfTokenAndCookies(servicePath) {
   const response = await executeHttpRequest(
     { destinationName: DEST },
@@ -122,11 +169,12 @@ async function getCsrfTokenAndCookies(servicePath) {
       url: `${servicePath}/`,
       headers: { 'x-csrf-token': 'Fetch', 'sap-client': SAP_CLIENT }
     },
-    { fetchCsrfToken: false }
+    { fetchCsrfToken: false }   // We handle the token ourselves (see above)
   );
   const setCookie = response.headers['set-cookie'];
   return {
     csrfToken: response.headers['x-csrf-token'],
+    // "name=value; Path=/; HttpOnly" -> keep only "name=value", join all cookies
     cookies: Array.isArray(setCookie)
       ? setCookie.map((c) => c.split(';')[0]).join('; ')
       : ''
@@ -142,26 +190,36 @@ async function fetchCurrentEtag(entityPath) {
 }
 
 // Convert backend errors into proper CAP errors
+// Passes SAP's HTTP status (404, 400, ...) and message through to the caller,
+// so the agent sees e.g. "createReturn failed: Material 54 is blocked" instead
+// of a generic 500.
 function handleError(req, err, context) {
   const status = err.response?.status;
   const backendMsg =
-    err.response?.data?.error?.message?.value ||
+    err.response?.data?.error?.message?.value ||   // SAP OData v2 error format
     err.response?.data?.error?.message ||
-    err.message;
+    err.message;                                    // Network / destination errors
   console.error(`${context} failed:`, status, backendMsg);
   return req.reject(status || 500, `${context} failed: ${backendMsg}`);
 }
 
 // SAP OData v2 returns { d: ... }
+// unwrap() strips that envelope; collections come back as { results: [...] }.
 const unwrap = (data) => (data && data.d !== undefined ? data.d : data);
 
 // SAP document numbers (invoice, return, credit memo) are interpolated into OData URLs, so restrict them
+// (prevents a value like "1') or ('1" from changing the query)
 const isDocNumber = (v) => typeof v === 'string' && /^[A-Za-z0-9]{1,10}$/.test(v);
 
 // OData v2 puts the ETag in __metadata.etag; the ETag response header is the fallback
+// The ETag is SAP's optimistic-locking version stamp: a PATCH must send it in
+// If-Match, and SAP refuses the change if the document was modified meanwhile.
 const getEtag = (response, doc) => doc?.__metadata?.etag || response?.headers?.etag || null;
 
 // Returns an error message if the request doesn't match the approved audit entry, else null
+// An approval is for one specific complaint. Without this check, an approved
+// R7 rejection (or an approval for another invoice) could be reused to create
+// a credit memo nobody approved.
 function approvalMismatch(auditLog, { invoiceNumber, rule }) {
   if (auditLog.invoiceNumber !== invoiceNumber) {
     return `invoiceNumber ${invoiceNumber} does not match approved request (${auditLog.invoiceNumber})`;
@@ -169,16 +227,25 @@ function approvalMismatch(auditLog, { invoiceNumber, rule }) {
   if (auditLog.rule !== rule) {
     return `rule ${rule} does not match approved request (${auditLog.rule})`;
   }
+  // e.g. R4 approved as REJECT (no overcharge found) must not become a CREDIT
   if (auditLog.proposedAction !== RULES[rule].proposedAction) {
     return `Approved request is ${auditLog.proposedAction}, not ${RULES[rule].proposedAction}; no document can be created`;
   }
   return null;
 }
 
+// CAP calls this with the ReturnsService instance; all handlers are registered here
 module.exports = function (srv) {
   const { AuditLog } = srv.entities;
 
   // ---- proposeAction: R1-R9 decision tree ----
+  // Reads the invoice from SAP and decides which rule applies. Order of checks:
+  //   invoice / line item exists?        no  -> R9
+  //   claim larger than invoice?         yes -> R7
+  //   already a document for invoice?    yes -> R8 (our audit log, then SAP)
+  //   reason keywords                        -> R3, R1, R2, R4, R5, R6
+  //   nothing matched                        -> R9 (ask the customer)
+  // Only proposes; nothing is stored or created here.
   srv.on('proposeAction', async (req) => {
     const { invoiceNumber, invoiceItem, material, quantity, claimedAmount, reason, soldToParty } = req.data;
 
@@ -193,7 +260,7 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV/A_BillingDocument('${invoiceNumber}')?$expand=to_Item&$format=json`
       );
       const invoice = unwrap(invResponse.data);
-      
+
       if (!invoice) {
         return {
           rule: 'R9',
@@ -206,6 +273,7 @@ module.exports = function (srv) {
       }
 
       // Find the line item
+      // Both item number and material must match the invoice line (e.g. item '10', material '54')
       const lineItem = (invoice.to_Item?.results || []).find(
         (i) => i.BillingDocumentItem === invoiceItem && i.Material === material
       );
@@ -221,6 +289,7 @@ module.exports = function (srv) {
         };
       }
 
+      // SAP sends numbers as strings; derive the unit price for credit calculations
       const invoicedQty = parseFloat(lineItem.BillingQuantity) || 0;
       const invoicedAmount = parseFloat(lineItem.NetAmount) || 0;
       const invoicedPrice = invoicedQty > 0 ? invoicedAmount / invoicedQty : 0;
@@ -237,6 +306,7 @@ module.exports = function (srv) {
         };
       }
 
+      // R7 also applies when the claimed money exceeds the invoiced amount
       if (claimedAmount > invoicedAmount) {
         return {
           rule: 'R7',
@@ -249,6 +319,7 @@ module.exports = function (srv) {
       }
 
       // R8: Check for existing approved complaints
+      // First in our own audit log: an approved entry that already produced a document
       const tx = cds.tx(req);
       const existingApproved = await tx.run(
         SELECT.one.from(AuditLog).where({
@@ -270,6 +341,9 @@ module.exports = function (srv) {
       }
 
       // Also check SAP for existing returns/credit memos
+      // (catches documents created manually in SAP, outside this app).
+      // srv.send calls our own checkExistingCredits handler; cds.tx(req).send
+      // would go to the database service and silently return undefined.
       try {
         const existingCreds = await srv.send('checkExistingCredits', { invoiceNumber });
         if ((existingCreds.existingReturns?.length > 0) || (existingCreds.existingCredits?.length > 0)) {
@@ -284,6 +358,7 @@ module.exports = function (srv) {
           };
         }
       } catch (err) {
+        // Non-fatal: if the lookup fails, continue; setApprovalStatus checks again before approval
         console.warn('checkExistingCredits failed (non-fatal):', err.message);
       }
 
@@ -294,6 +369,7 @@ module.exports = function (srv) {
       // R3 must come BEFORE R1 because "damaged and leaking" should be R3, not R1
 
       // R3: Irrecoverable goods (ruined, leaking, contaminated)
+      // Credit for the claimed quantity, or the whole line if no quantity was given
       if (lowerReason.includes('ruined') || lowerReason.includes('leak') || lowerReason.includes('contaminat')) {
         const creditValue = quantity > 0 ? quantity * invoicedPrice : invoicedAmount;
         return {
@@ -333,6 +409,7 @@ module.exports = function (srv) {
       }
 
       // R4: Price overcharge (requires PR00 verification)
+      // Compares the invoiced unit price with the agreed PR00 price in SAP
       if (lowerReason.includes('price') || lowerReason.includes('expensive') || lowerReason.includes('overcharg')) {
         // Query agreed price from SAP PR00 condition
         let agreedPrice = invoicedPrice; // Default to invoiced price
@@ -343,16 +420,18 @@ module.exports = function (srv) {
             salesOrganization: invoice.SalesOrganization,
             distributionChannel: invoice.DistributionChannel
           });
-          
+
           if (priceResult.agreedPrices?.length > 0) {
             agreedPrice = parseFloat(priceResult.agreedPrices[0].ConditionRateValue) || invoicedPrice;
           }
         } catch (err) {
+          // e.g. missing soldToParty: keep agreedPrice = invoicedPrice (no overcharge detected)
           console.warn('getAgreedPrice failed:', err.message);
         }
 
         // Detect overcharge
         if (invoicedPrice > agreedPrice) {
+          // Credit only the difference, for the claimed quantity
           const creditAmount = (invoicedPrice - agreedPrice) * quantity;
           return {
             rule: 'R4',
@@ -403,6 +482,7 @@ module.exports = function (srv) {
       }
 
       // R9: Reason unclear or unmatched
+      // The agent should ask the customer which of the cases applies
       return {
         rule: 'R9',
         proposedAction: 'PENDING',
@@ -412,6 +492,7 @@ module.exports = function (srv) {
         requiredApprover: null
       };
     } catch (err) {
+      // Invoice lookup failed (not found in SAP, or SAP unreachable): treat as R9
       console.error('proposeAction error:', err.message);
       return {
         rule: 'R9',
@@ -425,6 +506,7 @@ module.exports = function (srv) {
   });
 
   // ---- checkPrice: R4 price verification ----
+  // Pure calculation, no SAP call: useful when the agent already knows both prices
   srv.on('checkPrice', async (req) => {
     const { invoicedPrice, agreedPrice, quantity } = req.data;
 
@@ -440,6 +522,8 @@ module.exports = function (srv) {
   });
 
   // ---- logRequest: create a pending audit entry with rule and credit value ----
+  // Called after proposeAction (by the agent or the email listener). The entry
+  // starts as PENDING; the required approver tier is derived from rule and value.
   srv.on('logRequest', async (req) => {
     const { invoiceNumber, proposedAction, rule, reason, claimedQuantity, claimedAmount, creditValue, evidenceUrl } = req.data;
 
@@ -457,7 +541,7 @@ module.exports = function (srv) {
     }
 
     const ID = cds.utils.uuid();
-    const tx = cds.tx(req);
+    const tx = cds.tx(req);   // Same transaction as the request: committed when it succeeds
     const requiredApprover = getRequiredApprover(creditValue || 0, rule);
 
     await tx.run(
@@ -477,6 +561,7 @@ module.exports = function (srv) {
       })
     );
 
+    // Return the full row (incl. defaults and managed fields)
     return tx.run(SELECT.one.from(AuditLog).where({ ID }));
   });
 
@@ -485,6 +570,7 @@ module.exports = function (srv) {
   srv.on('setApprovalStatus', async (req) => {
     const { ID, status, approvedBy, approverRole } = req.data;
 
+    // --- Input checks ---
     if (!ID) {
       return req.reject(400, 'ID is required');
     }
@@ -510,6 +596,7 @@ module.exports = function (srv) {
     }
 
     // Check if approver role is sufficient
+    // Key = required tier, value = roles allowed to decide (that tier or higher)
     const allowedRoles = {
       'customer-service-lead': ['customer-service-lead', 'credit-manager', 'finance-director'],
       'credit-manager': ['credit-manager', 'finance-director'],
@@ -530,11 +617,14 @@ module.exports = function (srv) {
           return req.reject(409, `Duplicate in SAP: ${existing.CustomerReturn || existing.CreditMemoRequest} already exists for this invoice. Approval blocked.`);
         }
       } catch (err) {
+        // SAP unreachable: the approval still goes through (document creation will fail anyway if SAP is down)
         console.warn('Re-check checkExistingCredits failed (non-fatal):', err.message);
       }
     }
 
     // Update status
+    // The "approvalStatus: 'PENDING'" condition makes this atomic: if two
+    // approvers click at the same time, only the first update changes a row.
     const updated = await tx.run(
       UPDATE(AuditLog)
         .set({
@@ -546,6 +636,7 @@ module.exports = function (srv) {
         .where({ ID, approvalStatus: 'PENDING' })
     );
 
+    // 0 rows updated -> it was already decided
     if (!updated) {
       return req.reject(
         409,
@@ -557,6 +648,8 @@ module.exports = function (srv) {
   });
 
   // ---- confirmSpecialAgreement: R4 - unlock credit after special agreement confirmed ----
+  // R4 credit memos are only allowed once someone confirms the customer really
+  // has the lower agreed price (createCreditMemoRequest checks this flag).
   srv.on('confirmSpecialAgreement', async (req) => {
     const { ID } = req.data;
 
@@ -583,6 +676,7 @@ module.exports = function (srv) {
   });
 
   // ---- getInvoice ----
+  // Billing document header + items, passed through from SAP
   srv.on('getInvoice', async (req) => {
     const { invoiceNumber } = req.data;
     if (!isDocNumber(invoiceNumber)) {
@@ -601,6 +695,8 @@ module.exports = function (srv) {
   });
 
   // ---- checkExistingCredits: R8 - check for duplicate complaints ----
+  // Looks in SAP for return items and credit memo requests that reference the
+  // invoice (ReferenceSDDocument). Both queries run in parallel.
   srv.on('checkExistingCredits', async (req) => {
     const { invoiceNumber } = req.data;
     if (!isDocNumber(invoiceNumber)) {
@@ -628,6 +724,9 @@ module.exports = function (srv) {
   });
 
   // ---- createReturn: R1, R2 - return goods and block for credit after receipt ----
+  // Creates an SAP customer return (YRE) for an APPROVED R1/R2 entry. The
+  // document carries billing block 08, so no credit is issued until it is
+  // released (after the goods are received).
   srv.on('createReturn', async (req) => {
     const {
       auditLogID,
@@ -662,6 +761,7 @@ module.exports = function (srv) {
       return req.reject(400, `Audit log must be APPROVED before document creation`);
     }
 
+    // One approval = one document
     if (auditLog.sapDocument) {
       return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
     }
@@ -673,6 +773,7 @@ module.exports = function (srv) {
     }
 
     // Check for duplicate in SAP
+    // (via our audit log: another approved R1/R2 entry for this invoice already has a return)
     const existing = await tx.run(
       SELECT.one.from(AuditLog).where({
         invoiceNumber,
@@ -692,6 +793,8 @@ module.exports = function (srv) {
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
       // CHANGE 4: Set Cust. Reference to COMPLAINT-<invoice> only (removed rule and UUID suffix)
+      // Organisational data is fixed for the demo company (sales org YSOD, channel Y1, division Y5).
+      // The item references the invoice line, so SAP copies price and conditions from it.
       const payload = {
         CustomerReturnType: 'YRE',
         SalesOrganization: 'YSOD',
@@ -712,6 +815,7 @@ module.exports = function (srv) {
 
       console.log('createReturn payload:', JSON.stringify(payload, null, 2));
 
+      // Deep insert: header and item in one POST
       const response = await callDestination(
         'POST',
         `${servicePath}/A_CustomerReturn`,
@@ -725,8 +829,9 @@ module.exports = function (srv) {
       );
 
       const returnDoc = unwrap(response.data);
-      
+
       // Update audit log with SAP document number
+      // (and the ETag, so the document can be released later)
       await tx.run(
         UPDATE(AuditLog)
           .set({
@@ -737,6 +842,7 @@ module.exports = function (srv) {
           .where({ ID: auditLogID })
       );
 
+      // Every field returned here must also be declared in CreateReturnResult (CDS)
       return {
         CustomerReturn: returnDoc.CustomerReturn,
         CustomerReturnType: returnDoc.CustomerReturnType,
@@ -753,6 +859,9 @@ module.exports = function (srv) {
   });
 
   // ---- createCreditMemoRequest: R3, R4, R5 - credit without or before goods return ----
+  // Creates an SAP credit memo request (YCR) for an APPROVED R3/R4/R5 entry,
+  // also with billing block 08. Rule-specific preconditions:
+  //   R3 photo evidence, R4 confirmed special agreement, R5 proof of delivery.
   srv.on('createCreditMemoRequest', async (req) => {
     const {
       auditLogID,
@@ -771,6 +880,7 @@ module.exports = function (srv) {
       return req.reject(400, 'auditLogID is required');
     }
 
+    // SAP needs the real item number (e.g. '10') to copy the invoice line
     if (typeof invoiceItem !== 'string' || !/^\d{1,6}$/.test(invoiceItem)) {
       return req.reject(400, 'invoiceItem must be the numeric item number from the invoice (1-6 digits)');
     }
@@ -792,6 +902,7 @@ module.exports = function (srv) {
       return req.reject(400, `Audit log must be APPROVED before document creation`);
     }
 
+    // One approval = one document
     if (auditLog.sapDocument) {
       return req.reject(409, `Document already created: ${auditLog.sapDocumentType} ${auditLog.sapDocument}`);
     }
@@ -818,6 +929,7 @@ module.exports = function (srv) {
     }
 
     // Check for duplicate in SAP
+    // (via our audit log: another approved credit entry for this invoice already has a document)
     const existing = await tx.run(
       SELECT.one.from(AuditLog).where({
         invoiceNumber,
@@ -837,6 +949,7 @@ module.exports = function (srv) {
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
 
       // CHANGE 4: Set Cust. Reference to COMPLAINT-<invoice> only (removed rule and UUID suffix)
+      // Same structure as the return payload, but document type YCR
       const payload = {
         CreditMemoRequestType: 'YCR',
         SalesOrganization: 'YSOD',
@@ -870,8 +983,9 @@ module.exports = function (srv) {
       );
 
       const creditDoc = unwrap(response.data);
-      
+
       // Update audit log with SAP document number
+      // R5 additionally flags the entry for the warehouse to confirm the shortage
       await tx.run(
         UPDATE(AuditLog)
           .set({
@@ -883,6 +997,7 @@ module.exports = function (srv) {
           .where({ ID: auditLogID })
       );
 
+      // Every field returned here must also be declared in CreditMemoResult (CDS)
       return {
         CreditMemoRequest: creditDoc.CreditMemoRequest,
         SalesDocumentType: creditDoc.CreditMemoRequestType || creditDoc.SalesDocumentType,
@@ -899,8 +1014,11 @@ module.exports = function (srv) {
   });
 
   // ---- findInvoices: R9 - search for invoices when not named ----
+  // Customer + date range are filtered in SAP; the material filter is applied
+  // here on the items, and invoices without a matching item are dropped.
   srv.on('findInvoices', async (req) => {
     const { soldToParty, material, fromDate, toDate } = req.data;
+    // Strict formats, because the values go into the OData $filter
     const idOk = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v);
     const dateOk = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
@@ -908,6 +1026,7 @@ module.exports = function (srv) {
       return req.reject(400, 'soldToParty, material (ids) and fromDate, toDate (YYYY-MM-DD) are required');
     }
     try {
+      // OData v2 date literal syntax: datetime'YYYY-MM-DDT00:00:00'
       const filter =
         `SoldToParty eq '${soldToParty}' and ` +
         `BillingDocumentDate ge datetime'${fromDate}T00:00:00' and ` +
@@ -917,10 +1036,12 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV/A_BillingDocument?$filter=${encodeURIComponent(filter)}&$expand=to_Item&$format=json`
       );
       const invoices = (unwrap(response.data).results || [])
+        // Keep only the items for the material in question...
         .map((doc) => ({
           ...doc,
           to_Item: { results: (doc.to_Item?.results || []).filter((i) => i.Material === material) }
         }))
+        // ...and only invoices that still have such an item
         .filter((doc) => doc.to_Item.results.length > 0);
       return { soldToParty, material, fromDate, toDate, invoices };
     } catch (err) {
@@ -929,6 +1050,8 @@ module.exports = function (srv) {
   });
 
   // ---- getAgreedPrice: R4 - check PR00 condition to detect price overcharge ----
+  // Reads the PR00 (base price) condition record valid today for this customer,
+  // material, sales organisation and distribution channel.
   srv.on('getAgreedPrice', async (req) => {
     const { soldToParty, material, salesOrganization, distributionChannel } = req.data;
     const idOk = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v);
@@ -939,6 +1062,7 @@ module.exports = function (srv) {
 
     try {
       const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+      // Valid today: start date <= today <= end date
       const filter =
         `SoldToParty eq '${soldToParty}' and ` +
         `Material eq '${material}' and ` +
@@ -948,6 +1072,8 @@ module.exports = function (srv) {
         `ConditionValidityStartDate le datetime'${today}T00:00:00' and ` +
         `ConditionValidityEndDate ge datetime'${today}T00:00:00'`;
 
+      // The validity entity holds the dates; the price itself is in the
+      // expanded condition record (to_SlsPrcgConditionRecord)
       const response = await callDestination(
         'GET',
         `/sap/opu/odata/sap/API_SLSPRICINGCONDITIONRECORD_SRV/A_SlsPrcgCndnRecdValidity?$filter=${encodeURIComponent(filter)}&$expand=to_SlsPrcgConditionRecord&$format=json`
@@ -960,6 +1086,7 @@ module.exports = function (srv) {
         salesOrganization,
         distributionChannel,
         today,
+        // Flatten: lift the price out of the nested condition record
         agreedPrices: records.map((r) => ({
           ConditionRecord: r.ConditionRecord,
           ConditionType: r.ConditionType,
@@ -975,6 +1102,8 @@ module.exports = function (srv) {
 
   // ---- getReturnStatus: check if goods were received (for audit trail) ----
   // CHANGE 3: Implemented for step 5.1.3 - reports when goods are received (GoodsMovementStatus = C)
+  // Note: in the post-deploy test on DS4 the return header did not contain
+  // GoodsMovementStatus (result 'UNKNOWN'); to be verified after a goods receipt.
   srv.on('getReturnStatus', async (req) => {
     const { returnDocumentNumber } = req.data;
     if (!returnDocumentNumber) {
@@ -986,12 +1115,13 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturn('${returnDocumentNumber}')?$format=json`
       );
       const returnData = unwrap(response.data);
-      const received = returnData.GoodsMovementStatus === 'C';
+      const received = returnData.GoodsMovementStatus === 'C';   // C = completely processed
 
       console.log(`getReturnStatus for ${returnDocumentNumber}: GoodsMovementStatus=${returnData.GoodsMovementStatus}, received=${received}`);
 
       return {
         returnDocumentNumber,
+        // The API calls the field OverallSDProcessStatus; older name kept as fallback
         overallProcessingStatus: returnData.OverallSDProcessStatus ?? returnData.OverallProcessingStatus,
         goodsMovementStatus: returnData.GoodsMovementStatus || 'UNKNOWN',
         received
@@ -1002,6 +1132,7 @@ module.exports = function (srv) {
   });
 
   // ---- releaseCreditMemoRequest: remove billing block 08 after approval ----
+  // PATCH with If-Match: SAP only applies the change if the ETag is current.
   srv.on('releaseCreditMemoRequest', async (req) => {
     const { creditMemoNumber } = req.data;
     if (!isDocNumber(creditMemoNumber)) {
@@ -1009,6 +1140,7 @@ module.exports = function (srv) {
     }
     const servicePath = '/sap/opu/odata/sap/API_CREDIT_MEMO_REQUEST_SRV';
     try {
+      // Use the caller's ETag if given, otherwise read the current one from SAP
       const versionStamp = req.data.versionStamp ||
         await fetchCurrentEtag(`${servicePath}/A_CreditMemoRequest('${creditMemoNumber}')`);
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);
@@ -1027,16 +1159,19 @@ module.exports = function (srv) {
           'If-Match': versionStamp
         }
       );
+      // SAP answers a successful PATCH with 204 No Content
       return {
         creditMemoNumber,
         status: 'RELEASED'
       };
     } catch (err) {
+      // 412 Precondition Failed = the document changed since the ETag was read
       return handleError(req, err, 'releaseCreditMemoRequest');
     }
   });
 
   // ---- releaseCustomerReturn: remove billing block 08 after approval ----
+  // Same mechanism as releaseCreditMemoRequest, for customer returns
   srv.on('releaseCustomerReturn', async (req) => {
     const { returnDocumentNumber } = req.data;
     if (!isDocNumber(returnDocumentNumber)) {
@@ -1044,6 +1179,7 @@ module.exports = function (srv) {
     }
     const servicePath = '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV';
     try {
+      // Use the caller's ETag if given, otherwise read the current one from SAP
       const versionStamp = req.data.versionStamp ||
         await fetchCurrentEtag(`${servicePath}/A_CustomerReturn('${returnDocumentNumber}')`);
       const { csrfToken, cookies } = await getCsrfTokenAndCookies(servicePath);

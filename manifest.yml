@@ -1,9 +1,17 @@
+# =============================================================================
+# Cloud Foundry manifest for a plain "cf push" (alternative to the MTA deploy)
+# -----------------------------------------------------------------------------
+# The regular deployment uses mta.yaml (mbt build + cf deploy), which also
+# creates the HANA HDI container and deploys the tables. This manifest only
+# pushes the app and binds it to the destination/connectivity services; it is
+# handy for quick experiments but does not set up the database.
+# =============================================================================
 applications:
-- name: o2c-returns-agent
+- name: o2c-returns-agent        # Same app name as the MTA module, so it replaces it
   memory: 256M
   buildpacks:
     - nodejs_buildpack
   path: .
   services:
-    - Connectivity
-    - Destinations
+    - Connectivity               # Cloud Connector tunnel to the on-premise DS4 system
+    - Destinations               # Holds the "DS4" destination (URL + credentials)

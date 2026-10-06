@@ -1,34 +1,66 @@
+// =============================================================================
+// Email listener: turns customer complaint emails into audit log entries
+// -----------------------------------------------------------------------------
+// Started from srv/server.js when EMAIL_ENABLED=true. Every EMAIL_POLL_MS it
+// logs in to the IMAP mailbox, reads all unread emails and for each one:
+//
+//   1. parseEmail()     -> pull invoice number, material, quantity, amount,
+//                          customer and the kind of complaint out of the text
+//   2. proposeAction    -> ReturnsService decides the rule (R1–R9)
+//   3. logRequest       -> creates a PENDING audit entry for approval
+//
+// The listener never creates SAP documents; that only happens after a human
+// approves the entry. Emails are flagged in the mailbox so they are processed
+// once:
+//   \Seen                -> logged successfully
+//   \Seen + $NeedsReview -> could not be handled automatically (missing data, R9)
+//   \Seen + $Ignored     -> sender outside EMAIL_ALLOWED_DOMAINS
+//   (left unread)        -> technical error, retried on the next poll
+//
+// Configuration (environment, set via email.mtaext on BTP):
+//   EMAIL_HOST, EMAIL_PORT (993), EMAIL_USER, EMAIL_PASSWORD   IMAP access
+//   EMAIL_POLL_MS (60000)                                      poll interval
+//   EMAIL_ALLOWED_DOMAINS                                      sender allow-list
+// =============================================================================
+
 const cds = require('@sap/cds');
-const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser');
+const { ImapFlow } = require('imapflow');       // IMAP client
+const { simpleParser } = require('mailparser'); // Raw MIME -> subject, text, from
 
 const LOG = cds.log('email');
 const POLL_MS = Number(process.env.EMAIL_POLL_MS || 60000);
 // Optional: comma-separated sender domains, e.g. "customer.com,gmail.com"
+// Empty means every sender is accepted.
 const ALLOWED = (process.env.EMAIL_ALLOWED_DOMAINS || '')
   .split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
 
 // ---- Extract structured data from the email text ----
+// Simple keyword/regex extraction; anything not found comes back as null and
+// the email is flagged for manual review if the essentials are missing.
 function parseEmail({ subject = '', text = '', from = '' }) {
+  // Search subject and body together ("Invoice 90000123" is often in the subject)
   const body = `${subject}\n${text}`;
   const lower = body.toLowerCase();
 
-  // Extract invoice number
+  // Extract invoice number: "invoice 90000123", "Invoice no. 90000123", "invoice #: ..."
+  // SAP billing documents are 8–10 digits.
   const invoice = body.match(/invoice\s*(?:no\.?|number|#)?\s*[:#]?\s*(\d{8,10})/i);
-  
-  // Extract material number
+
+  // Extract material number: "material TG11", "material no: 54"
   const material = body.match(/material\s*(?:no\.?|number|#)?\s*[:#]?\s*([A-Za-z0-9_-]{1,40})/i);
-  
-  // Extract quantity and unit
+
+  // Extract quantity and unit: "5 PC", "2,5 KG", "3 pieces"
   const qty = body.match(/(\d+(?:[.,]\d+)?)\s*(KG|PC|EA|ST|L|pieces?|units?)\b/i);
-  
-  // Extract claimed amount (for price disputes)
+
+  // Extract claimed amount (for price disputes): "claim EUR 50", "refund of 12.50"
   const claimedAmount = body.match(/(?:claim|ask for|credit|refund)\s*(?:of|at|for)?\s*(?:EUR|€|\$)?s*(\d+(?:[.,]\d+)?)/i);
-  
-  // Extract customer/sold-to party (if provided)
+
+  // Extract customer/sold-to party (if provided): "customer 10021", "sold-to: 100001"
   const soldToParty = body.match(/(?:customer|party|sold-?to|account|cust[.]?\s*no\.?)\s*(?:#|:)?\s*(\d{5,6})/i);
 
-  // Determine proposed action based on keywords
+  // Determine proposed action based on keywords.
+  // Order matters: a price complaint wins over damage words, replacement over return.
+  // proposeAction later makes the final rule decision from the reason text.
   let proposedAction = null;
   if (/wrong price|overcharg|price|too much|expensive/.test(lower)) {
     proposedAction = 'CREDIT';
@@ -39,13 +71,15 @@ function parseEmail({ subject = '', text = '', from = '' }) {
   }
 
   // Extract reason (full complaint text, truncated)
+  // Note: '.' does not match newlines, so this takes the first line of the body
+  // (up to 500 characters); falls back to the subject for empty bodies.
   const reasonMatch = text.match(/^(.{1,500})/);
   const reason = reasonMatch ? reasonMatch[1].trim() : subject;
 
   return {
     invoiceNumber: invoice?.[1] || null,
     material: material?.[1] || null,
-    quantity: qty ? parseFloat(qty[1].replace(',', '.')) : null,
+    quantity: qty ? parseFloat(qty[1].replace(',', '.')) : null,   // "2,5" -> 2.5
     unit: qty ? qty[2].toUpperCase() : null,
     claimedAmount: claimedAmount ? parseFloat(claimedAmount[1].replace(',', '.')) : null,
     soldToParty: soldToParty?.[1] || null,
@@ -57,18 +91,21 @@ function parseEmail({ subject = '', text = '', from = '' }) {
 
 // ---- Process all unread emails once ----
 async function pollOnce(srv) {
+  // A fresh connection per poll keeps things simple and survives server restarts
   const client = new ImapFlow({
     host: process.env.EMAIL_HOST,
     port: Number(process.env.EMAIL_PORT || 993),
-    secure: true,
+    secure: true,                 // IMAPS (TLS)
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASSWORD },
-    logger: false
+    logger: false                 // imapflow is very chatty otherwise
   });
 
   await client.connect();
+  // Lock the inbox so flags are not changed by another session meanwhile
   const lock = await client.getMailboxLock('INBOX');
 
   try {
+    // UIDs of all unread messages (UIDs are stable, sequence numbers are not)
     const uids = await client.search({ seen: false }, { uid: true });
 
     for (const uid of uids) {
@@ -93,7 +130,8 @@ async function pollOnce(srv) {
       }
 
       try {
-        // Step 1: Call proposeAction to get rule, reasoning, and credit value
+        // Step 1: Call proposeAction to get rule, reasoning, and credit value.
+        // Runs as a privileged user because there is no logged-in user here.
         const proposal = await srv.tx({ user: cds.User.privileged }, (tx) =>
           tx.send('proposeAction', {
             invoiceNumber: info.invoiceNumber,
@@ -120,7 +158,8 @@ async function pollOnce(srv) {
           continue;
         }
 
-        // Step 3: Log the request with the rule, credit value, and reasoning
+        // Step 3: Log the request with the rule, credit value, and reasoning.
+        // This creates the PENDING audit entry an approver will see.
         const entry = await srv.tx({ user: cds.User.privileged }, (tx) =>
           tx.send('logRequest', {
             invoiceNumber: info.invoiceNumber,
@@ -149,6 +188,7 @@ async function pollOnce(srv) {
       }
     }
   } finally {
+    // Always release the mailbox and disconnect, even after an error
     lock.release();
     await client.logout();
   }
@@ -156,24 +196,27 @@ async function pollOnce(srv) {
 
 // ---- Start polling (skips a run if the previous one is still busy) ----
 function start(srv) {
+  // Without credentials the app still runs, just without the email channel
   const missing = ['EMAIL_HOST', 'EMAIL_USER', 'EMAIL_PASSWORD'].filter((k) => !process.env[k]);
   if (missing.length) {
     LOG.warn('Email listener disabled, missing:', missing.join(', '));
     return;
   }
 
+  // Guard against overlapping polls when one run takes longer than POLL_MS
   let running = false;
   const tick = async () => {
     if (running) return;
     running = true;
     try { await pollOnce(srv); }
-    catch (err) { LOG.error('Poll failed:', err.message); }
+    catch (err) { LOG.error('Poll failed:', err.message); }   // e.g. mailbox unreachable; try again next tick
     finally { running = false; }
   };
 
   LOG.info(`Email listener started, polling every ${POLL_MS / 1000}s`);
-  tick();
-  setInterval(tick, POLL_MS);
+  tick();                         // First poll right away
+  setInterval(tick, POLL_MS);     // Then on a fixed interval
 }
 
+// parseEmail is exported as well so it can be unit-tested
 module.exports = { start, parseEmail };

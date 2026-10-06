@@ -1,8 +1,23 @@
+# =============================================================================
+# Multi-Target Application descriptor (BTP Cloud Foundry deployment)
+# -----------------------------------------------------------------------------
+# Build and deploy:
+#   mbt build
+#   cf deploy mta_archives/o2c-returns-agent_1.0.0.mtar -e email.mtaext
+#
+# "-e email.mtaext" adds the EMAIL_* environment variables for the inbox poller.
+# That file holds the mailbox password and is never committed.
+# =============================================================================
 _schema-version: '3.1'
 ID: o2c-returns-agent
 version: 1.0.0
 parameters:
   enable-parallel-deployments: true
+
+# Runs once before the modules are built:
+#   npm ci                    -> clean install from package-lock.json (fails if the
+#                                lockfile is out of sync with package.json)
+#   cds build --production    -> generates gen/srv (Node app) and gen/db (HANA artifacts)
 build-parameters:
   before-all:
     - builder: custom
@@ -11,6 +26,9 @@ build-parameters:
         - npx cds build --production
 
 modules:
+  # ---------------------------------------------------------------------------
+  # The CAP Node.js app: OData API at /odata/v4/returns + optional email poller
+  # ---------------------------------------------------------------------------
   - name: o2c-returns-agent
     type: nodejs
     path: gen/srv
@@ -18,14 +36,17 @@ modules:
       buildpack: nodejs_buildpack
       memory: 256M
       routes:
-        - route: o2c-returns-agent.${default-domain}
+        - route: o2c-returns-agent.${default-domain}   # e.g. ...cfapps.ap21.hana.ondemand.com
     build-parameters:
       builder: npm
     requires:
-      - name: o2c-returns-hdi
-      - name: Destinations
-      - name: Connectivity
+      - name: o2c-returns-hdi    # HANA container for the audit log
+      - name: Destinations       # "DS4" destination to SAP S/4HANA
+      - name: Connectivity       # Cloud Connector proxy for on-premise access
 
+  # ---------------------------------------------------------------------------
+  # One-off task that creates/updates the HANA tables, then stops
+  # ---------------------------------------------------------------------------
   - name: o2c-returns-agent-db-deployer
     type: hdb
     path: gen/db
@@ -35,11 +56,13 @@ modules:
       - name: o2c-returns-hdi
 
 resources:
+  # HDI container inside the HANA Cloud instance (trial: stops nightly, start it before deploying)
   - name: o2c-returns-hdi
     type: com.sap.xs.hdi-container
     parameters:
       service: hana
       service-plan: hdi-shared
+  # Created manually in the BTP cockpit; the MTA only binds them
   - name: Destinations
     type: org.cloudfoundry.existing-service
   - name: Connectivity
