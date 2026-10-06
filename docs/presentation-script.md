@@ -1,4 +1,4 @@
-# O2C Returns Agent: presentation script (about 10 minutes)
+# O2C Returns Agent: presentation script (about 12 minutes)
 
 ## 1. The problem (1 min)
 
@@ -85,7 +85,53 @@ INV=<fresh invoice>; MAT=<material>; CUST=<sold-to>     # from getInvoice
 | Release | RELEASED |
 | Second proposal | R8 |
 
-## 5. Quality and what we fixed (1 min)
+## 5. The Control Tower view (2 min)
+
+> "The same service also feeds the Reclaim Control Tower. It looks at the whole order-to-cash process,
+> finds where money is stuck, and says which agent should pick it up. And it can't change anything."
+
+- **Eight read-only functions** in the same CAP service, on the same `DS4` destination. They are all OData
+  functions (GET), with no actions, so there is no write path at all.
+- **Every answer shows its sources.** Each one returns `underlyingRequests` (the exact SAP GETs it made) and `capturedOn`.
+  The Control Tower shows these in its request log.
+- **One function per row of the L4 table:**
+
+| L4 | What it finds | Routed to | Function |
+|---|---|---|---|
+| 3.4.1 | Goods issued 3+ days ago, POD still open | 6 POD Chaser | `listDeliveriesAwaitingPod` |
+| 4.1.1 | Shipped, not billed | 7 Billing Gatekeeper | `listUnbilledDeliveries`, `listBillingDueList` |
+| 2.3.3 · 4.1.4 | Credit, delivery and billing blocks | 3 Block Buster | `listBlockedOrders` |
+| 5.2.1 | Return older than 7 days, no credit memo | 8 Returns & Credit | `listReturnsWithoutCredit` |
+| 6.1.2 | Overdue receivables per customer | 9 Cash Application | `listOverdueReceivables` |
+
+- **One order end to end:** `checkOrderConformance` follows order → delivery → invoice and gives one finding per cause.
+  - If POD is still open, the finding is 3.4.1, not "unbilled".
+  - If the order is blocked for billing, it's 4.1.4.
+  - A cancelled invoice doesn't count as billed.
+
+**Demo (read-only, safe to run any time):**
+
+```bash
+B=https://o2c-returns-agent.cfapps.ap21.hana.ondemand.com/odata/v4/returns
+curl -s "$B/listOverdueReceivables(companyCode='YDE1',keyDate='2026-10-01')"   # 368 598.40 EUR, as in the guide
+curl -s "$B/checkOrderConformance(salesOrder='1876')"                          # 3.4.1: POD open on 80608983
+curl -s "$B/checkOrderConformance(salesOrder='1937')"                          # conforms: delivery 80609033 -> invoice 90000455
+curl -s "$B/checkOrderConformance(salesOrder='1832')"                          # 2.3.3: credit block, a person decides
+```
+
+Say: "Same numbers as the organisers' reference snapshot, read live from SAP, and each answer lists the requests it made."
+
+**Live numbers (6 Oct):**
+- 178 unbilled deliveries, 83 of them waiting for POD
+- 144 blocked orders
+- 368 598.40 EUR and 150 RON overdue on 1 Oct
+- 51 returns without a credit memo
+
+**Built for the real system:**
+- The billing due list fails a whole page when one row is unreadable. The function re-reads that page row by row and reports `skippedRows`.
+- Returns delivery items give the real goods-receipt status (`getReturnStatus`, e.g. return 60000014 → delivery 84000000, received).
+
+## 6. Quality and what we fixed (1 min)
 
 - **55 automated tests** with a simulated SAP system (`npm test`), so they run without touching DS4.
 - **Fixed during hardening:**
@@ -100,10 +146,10 @@ INV=<fresh invoice>; MAT=<material>; CUST=<sold-to>     # from getInvoice
   - backup archive and rollback ready
   - email settings kept outside git
 
-## 6. Next steps (30 s)
+## 7. Next steps (30 s)
 
 - Real authentication with XSUAA roles instead of the dummy auth used for the demo.
-- Read the goods receipt status from the return items, so credits are released automatically after receipt.
+- Release credits automatically once `getReturnStatus` reports the goods received (the status is read already).
 - A Fiori approval inbox, and smarter email parsing (item numbers, attachments as evidence).
 
 ## Likely questions
@@ -113,3 +159,5 @@ INV=<fresh invoice>; MAT=<material>; CUST=<sold-to>     # from getInvoice
 - **"What if two people approve at once?"** The approval update is atomic, so only the first one counts. The second gets a 409.
 - **"Who approves a large credit?"** Above 5,000 EUR always the finance director, for every rule. For example, an 8,100 EUR "ruined goods" credit (R3) needs the finance director, and a credit manager trying to approve it gets a 403.
 - **"What about duplicates created directly in SAP?"** The app checks SAP when it proposes and again before approval.
+- **"Can the Control Tower change anything in SAP?"** No. It has only OData functions (GET) and no actions. Each answer lists the SAP requests it made, and they are all GETs.
+- **"Why do your numbers differ from the guide?"** The guide is a 1 Oct snapshot. With `keyDate='2026-10-01'`, overdue receivables match exactly. Today's counts differ because deliveries have aged: more are past 14 days, and fewer are inside the grace period.

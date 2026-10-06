@@ -11,6 +11,9 @@
 //               without an APPROVED audit entry that matches the request.
 //   3. ACT      createReturn / createCreditMemoRequest create the SAP document
 //               with billing block 08; release* removes the block afterwards.
+//   4. OBSERVE  getReturnStatus reads the goods receipt of a return, and the
+//               read-only Control Tower functions (srv/control-tower.js) report
+//               O2C findings across the whole client. Both only read.
 //
 // All SAP calls go through the BTP destination "DS4" (SAP S/4HANA, client 100)
 // via the SAP Cloud SDK, using the standard OData v2 APIs:
@@ -18,6 +21,8 @@
 //   API_CUSTOMER_RETURN_SRV          customer returns (YRE)
 //   API_CREDIT_MEMO_REQUEST_SRV      credit memo requests (YCR)
 //   API_SLSPRICINGCONDITIONRECORD_SRV  agreed prices (PR00)
+//   API_CUSTOMER_RETURNS_DELIVERY_SRV  returns deliveries (goods receipt of a return)
+// The Control Tower functions use further read APIs, listed in srv/control-tower.js.
 //
 // Rule overview:
 //   R1 damaged in transit   -> RETURN (YRE)   R6 replacement        -> customer service

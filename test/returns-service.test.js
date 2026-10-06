@@ -268,6 +268,7 @@ describe('5. Result fields reach the OData client', () => {
     expect(data).toMatchObject({ CreditMemoRequest: '70000001', SalesDocumentType: 'YCR' });
   });
 
+  // The goods receipt is on the returns delivery items, not on the return header
   test('getReturnStatus reads the goods receipt from the returns delivery items', async () => {
     const { data } = await GET(`/odata/v4/returns/getReturnStatus(returnDocumentNumber='60000001')`);
     expect(data).toMatchObject({

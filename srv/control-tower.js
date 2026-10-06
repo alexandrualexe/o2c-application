@@ -16,6 +16,21 @@
 //   amounts         strings with 2 decimals ("10800.00"), currency next to them
 //   document numbers  leading zeros stripped ("0000001876" -> "1876")
 //
+// The functions, with the L4 step of the Control Tower table they feed and its owner:
+//
+//   #  function                    L4             owner (agent)          SAP API (all GET)
+//   1  listUnbilledDeliveries      4.1.1          7 Billing Gatekeeper   API_OUTBOUND_DELIVERY_SRV;v=0002
+//   2  listDeliveriesAwaitingPod   3.4.1          6 POD Chaser           API_OUTBOUND_DELIVERY_SRV;v=0002
+//   3  listBlockedOrders           2.3.3 · 4.1.4  3 Block Buster         API_SALES_ORDER_SRV
+//   4  listOverdueReceivables      6.1.2          9 Cash Application     FAR_CUSTOMER_LINE_ITEMS
+//   5  listBillingDueList          4.1.1          7 Billing Gatekeeper   SD_CUSTOMER_INVOICES_CREATE
+//   6  getCustomerAddresses        (map, names)   –                      API_BUSINESS_PARTNER
+//   7  checkOrderConformance       one order: order -> delivery -> invoice, findings per L4 step
+//   8  listReturnsWithoutCredit    5.2.1          8 Returns & Credit     API_CUSTOMER_RETURN_SRV
+//
+// Severity and grouping are applied by Reclaim, except where noted (3-day POD
+// grace, 7-day return age, findings of checkOrderConformance).
+//
 // There are deliberately no actions here: the Control Tower must have no write path.
 // =============================================================================
 
@@ -341,6 +356,17 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
   });
 
   // ---- 7 · checkOrderConformance: has a sales order followed the O2C process? ----
+  // Reads the order, its deliveries (delivery items that reference the order) and its
+  // invoices (billing items that reference it), then reports deviations:
+  //
+  //   credit block on the order               -> 2.3.3  blocks   (always checked)
+  //   delivered, not billed, and ...
+  //     a delivery still waits for its POD     -> 3.4.1  pod      (POD is the cause)
+  //     else a header or item billing block    -> 4.1.4  blocks
+  //     else                                   -> 4.1.1  billing
+  //
+  // A delivered-but-unbilled order gives exactly one of the last three findings.
+  // No delivery yet is not a deviation. Cancelled invoices do not count as billed.
   readFunction('checkOrderConformance', async (req, trace) => {
     const { salesOrder } = req.data;
     if (!isId(salesOrder)) return req.reject(400, 'salesOrder must be 1–10 letters or digits');

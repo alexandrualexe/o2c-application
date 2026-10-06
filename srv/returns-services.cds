@@ -3,7 +3,9 @@
 // -----------------------------------------------------------------------------
 // Served as OData v4 at /odata/v4/returns. It is called by:
 //   - the AI agent / front end (step by step, one action per decision),
-//   - the email listener (srv/email-listener.js), in-process.
+//   - the email listener (srv/email-listener.js), in-process,
+//   - the Reclaim Control Tower, which uses only the read-only functions in
+//     the "Control Tower" section below.
 //
 // Implementation: srv/returns-services.js (same base name, so CAP links them).
 //
@@ -15,7 +17,7 @@
 //   confirmSpecialAgreement        -> R4 only
 //   createReturn / createCreditMemoRequest -> SAP document (billing block 08)
 //   releaseCustomerReturn / releaseCreditMemoRequest -> remove billing block
-//   getReturnStatus                -> has the warehouse received the goods?
+//   getReturnStatus                -> has the warehouse received the goods? (returns delivery)
 //
 // Note on types: SAP OData v2 sends amounts and quantities as strings, so the
 // SAP-shaped types below use String and pass the values through unchanged.

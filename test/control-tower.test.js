@@ -48,6 +48,7 @@ const paged = (rows) => (url) => {
   return { results: rows.slice(skip, skip + top) };
 };
 
+// The read-only promise: every Control Tower entry point must be a function (GET), never an action (POST)
 describe('Control Tower: metadata', () => {
   test('all eight are functions (GET), none is an action', async () => {
     const { data } = await GET(`${BASE}/$metadata`);
@@ -60,6 +61,7 @@ describe('Control Tower: metadata', () => {
   });
 });
 
+// Envelope, output formatting, paging, optional filter and error handling (shared by all functions)
 describe('listUnbilledDeliveries', () => {
   test('envelope, formatting and paging until a short page', async () => {
     const rows = Array.from({ length: 150 }, (_, i) => ({
@@ -108,6 +110,7 @@ describe('listUnbilledDeliveries', () => {
   });
 });
 
+// The 3-day grace period is applied in the SAP filter
 describe('listDeliveriesAwaitingPod', () => {
   test('filters on goods issue at least 3 days ago and returns POD fields', async () => {
     routes = {
@@ -128,6 +131,7 @@ describe('listDeliveriesAwaitingPod', () => {
   });
 });
 
+// Amount formatting and the three kinds of block in one filter
 describe('listBlockedOrders', () => {
   test('amounts as 2-decimal strings next to the currency', async () => {
     routes = {
@@ -147,6 +151,7 @@ describe('listBlockedOrders', () => {
   });
 });
 
+// Totals are summed in cents per customer; the currency falls back to the company code's
 describe('listOverdueReceivables', () => {
   test('sums per customer, sorts descending, total as number', async () => {
     routes = {
@@ -183,6 +188,7 @@ describe('listOverdueReceivables', () => {
   });
 });
 
+// The due-list service rejects $orderby, so it must never be sent
 describe('listBillingDueList', () => {
   test('maps items and never sends $orderby', async () => {
     routes = {
@@ -204,6 +210,7 @@ describe('listBillingDueList', () => {
   });
 });
 
+// DS4 answers 500 for a whole page if one row in it is unreadable: re-read row by row, skip and count
 describe('listBillingDueList: unreadable rows', () => {
   test('a page with a bad row is re-read row by row; the bad row is skipped and counted', async () => {
     const rows = Array.from({ length: 30 }, (_, i) => ({ ReferenceSDDocument: String(80000100 + i), NetAmount: '1' }));
@@ -230,6 +237,7 @@ describe('listBillingDueList: unreadable rows', () => {
   });
 });
 
+// 5.2.1: returns older than 7 days whose credit memo is missing or cancelled
 describe('listReturnsWithoutCredit', () => {
   test('older than 7 days, keeps returns without a credit memo in force', async () => {
     routes = {
@@ -270,6 +278,7 @@ describe('listReturnsWithoutCredit', () => {
   });
 });
 
+// Three reads in parallel; partners without an address are listed separately
 describe('getCustomerAddresses', () => {
   test('addresses, names, Norway list and partners without address', async () => {
     routes = {
@@ -300,6 +309,7 @@ describe('getCustomerAddresses', () => {
   });
 });
 
+// One order through order -> delivery -> invoice; which finding wins is tested case by case
 describe('checkOrderConformance', () => {
   const order = (extra = {}) => () => ({ SalesOrder: '1876', TotalCreditCheckStatus: '', ...extra });
 
