@@ -49,10 +49,11 @@ const paged = (rows) => (url) => {
 };
 
 describe('Control Tower: metadata', () => {
-  test('all seven are functions (GET), none is an action', async () => {
+  test('all eight are functions (GET), none is an action', async () => {
     const { data } = await GET(`${BASE}/$metadata`);
     for (const name of ['listUnbilledDeliveries', 'listDeliveriesAwaitingPod', 'listBlockedOrders',
-      'listOverdueReceivables', 'listBillingDueList', 'getCustomerAddresses', 'checkOrderConformance']) {
+      'listOverdueReceivables', 'listBillingDueList', 'getCustomerAddresses', 'checkOrderConformance',
+      'listReturnsWithoutCredit']) {
       expect(data).toMatch(new RegExp(`<Function Name="${name}"`));
       expect(data).not.toMatch(new RegExp(`<Action Name="${name}"`));
     }
@@ -226,6 +227,46 @@ describe('listBillingDueList: unreadable rows', () => {
   test('an error other than 500 is not retried row by row: it stays an HTTP error', async () => {
     routes = { C_BillingDueListItem_F0798: () => Object.assign(new Error('down'), { response: { status: 503, data: {} } }) };
     expect(await status("listBillingDueList(soldToParty='10021')")).toBe(503);
+  });
+});
+
+describe('listReturnsWithoutCredit', () => {
+  test('older than 7 days, keeps returns without a credit memo in force', async () => {
+    routes = {
+      A_CustomerReturn: [
+        { CustomerReturn: '60000164', CustomerReturnType: 'YRE', SoldToParty: '0000010021', CreationDate: ms(daysAgo(20)),
+          TotalNetAmount: '540', TransactionCurrency: 'EUR', SDDocumentReason: 'Z02', HeaderBillingBlockReason: '08' },
+        { CustomerReturn: '60000165', SoldToParty: '10021', CreationDate: ms(daysAgo(15)) },   // credited
+        { CustomerReturn: '60000166', SoldToParty: '10021', CreationDate: ms(daysAgo(10)) },   // credit memo cancelled
+        { CustomerReturn: '60000167', SoldToParty: '10021', CreationDate: ms(daysAgo(9)), OverallSDDocumentRejectionSts: 'C' }
+      ],
+      A_BillingDocumentItem: [
+        { BillingDocument: '0090000500', SalesDocument: '60000165' },
+        { BillingDocument: '0090000501', SalesDocument: '60000166' }
+      ],
+      'A_BillingDocument?': [{ BillingDocument: '0090000501', BillingDocumentIsCancelled: true }]
+    };
+    const out = await call('listReturnsWithoutCredit(top=500)');
+    expect(out.underlyingRequests[0]).toContain(
+      `API_CUSTOMER_RETURN_SRV/A_CustomerReturn?$filter=CreationDate le datetime'${daysAgo(7)}T00:00:00'`);
+    expect(out.underlyingRequests[0]).toContain('$orderby=CreationDate asc');
+    expect(out.underlyingRequests[1]).toContain(
+      "SalesDocument eq '60000164' or SalesDocument eq '60000165' or SalesDocument eq '60000166'");
+    expect(out.response.count).toBe(2);
+    expect(out.response.returns[0]).toEqual({
+      CustomerReturn: '60000164', CustomerReturnType: 'YRE', SoldToParty: '10021',
+      CreationDate: daysAgo(20), daysSinceCreation: 20, TotalNetAmount: '540.00', TransactionCurrency: 'EUR',
+      SDDocumentReason: 'Z02', HeaderBillingBlockReason: '08'
+    });
+    expect(out.response.returns[1].CustomerReturn).toBe('60000166');
+    expect(calls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
+  test('optional soldToParty; bad input -> 400', async () => {
+    const out = await call("listReturnsWithoutCredit(top=5,soldToParty='10021')");
+    expect(out.underlyingRequests[0]).toContain("and SoldToParty eq '10021'");
+    expect(out.response).toEqual({ count: 0, returns: [] });
+    expect(await status("listReturnsWithoutCredit(soldToParty='a%20or%201')")).toBe(400);
   });
 });
 

@@ -47,6 +47,10 @@ function resetSap() {
     },
     existingReturns: [],
     existingCredits: [],
+    returnsDeliveryItems: [
+      { ref: '60000001', DeliveryDocument: '0084000000', GoodsMovementStatus: 'C' },
+      { ref: '60000001', DeliveryDocument: '0084000000', GoodsMovementStatus: 'C' }
+    ],
     calls: []
   };
 }
@@ -79,7 +83,12 @@ executeHttpRequest.mockImplementation(async (dest, { method, url, data, headers 
   // The ETags differ from the ones returned on create ("v2" vs "v1"), so tests
   // can tell whether the release used a freshly read ETag.
   if (method === 'GET' && url.includes('A_CustomerReturn(')) {
-    return ok({ CustomerReturn: '60000001', OverallSDProcessStatus: 'B', GoodsMovementStatus: 'C', __metadata: { etag: 'W/"ret-v2"' } });
+    return ok({ CustomerReturn: '60000001', OverallSDProcessStatus: 'B', __metadata: { etag: 'W/"ret-v2"' } });
+  }
+  // Returns delivery items (goods receipt of a return)
+  if (method === 'GET' && url.includes('A_ReturnsDeliveryItem?')) {
+    const ref = decodeURIComponent(url).match(/ReferenceSDDocument eq '(\w+)'/)[1];
+    return ok({ results: sap.returnsDeliveryItems.filter((i) => i.ref === ref) });
   }
   if (method === 'GET' && url.includes('A_CreditMemoRequest(')) {
     return ok({ CreditMemoRequest: '70000001', __metadata: { etag: 'W/"cr-v2"' } });
@@ -259,9 +268,26 @@ describe('5. Result fields reach the OData client', () => {
     expect(data).toMatchObject({ CreditMemoRequest: '70000001', SalesDocumentType: 'YCR' });
   });
 
-  test('getReturnStatus returns processing and goods movement status', async () => {
+  test('getReturnStatus reads the goods receipt from the returns delivery items', async () => {
     const { data } = await GET(`/odata/v4/returns/getReturnStatus(returnDocumentNumber='60000001')`);
-    expect(data).toMatchObject({ overallProcessingStatus: 'B', goodsMovementStatus: 'C', received: true });
+    expect(data).toMatchObject({
+      overallProcessingStatus: 'B', returnsDelivery: '84000000', goodsMovementStatus: 'C', received: true
+    });
+    expect(decodeURIComponent(sap.calls.find((c) => c.url.includes('A_ReturnsDeliveryItem')).url))
+      .toContain("API_CUSTOMER_RETURNS_DELIVERY_SRV;v=0002/A_ReturnsDeliveryItem?$filter=ReferenceSDDocument eq '60000001'");
+  });
+
+  test('getReturnStatus: one item not yet received -> B, not received', async () => {
+    sap.returnsDeliveryItems[1].GoodsMovementStatus = 'A';
+    const { data } = await GET(`/odata/v4/returns/getReturnStatus(returnDocumentNumber='60000001')`);
+    expect(data).toMatchObject({ goodsMovementStatus: 'B', received: false });
+  });
+
+  test('getReturnStatus: no returns delivery yet -> NO_DELIVERY; padded reference tried too', async () => {
+    sap.returnsDeliveryItems = [];
+    const { data } = await GET(`/odata/v4/returns/getReturnStatus(returnDocumentNumber='60000001')`);
+    expect(data).toMatchObject({ returnsDelivery: '', goodsMovementStatus: 'NO_DELIVERY', received: false });
+    expect(sap.calls.filter((c) => c.url.includes('A_ReturnsDeliveryItem'))).toHaveLength(2);
   });
 });
 

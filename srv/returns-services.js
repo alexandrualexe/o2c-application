@@ -1104,13 +1104,13 @@ module.exports = function (srv) {
   });
 
   // ---- getReturnStatus: check if goods were received (for audit trail) ----
-  // CHANGE 3: Implemented for step 5.1.3 - reports when goods are received (GoodsMovementStatus = C)
-  // Note: in the post-deploy test on DS4 the return header did not contain
-  // GoodsMovementStatus (result 'UNKNOWN'); to be verified after a goods receipt.
+  // Step 5.1.3. The return header has no goods movement status: it is on the items of
+  // the returns delivery that references the return (Agent 8 guide, e.g. return
+  // 60000014 -> returns delivery 84000000). GoodsMovementStatus C = received.
   srv.on('getReturnStatus', async (req) => {
     const { returnDocumentNumber } = req.data;
-    if (!returnDocumentNumber) {
-      return req.reject(400, 'returnDocumentNumber is required');
+    if (!isDocNumber(returnDocumentNumber)) {
+      return req.reject(400, 'returnDocumentNumber must be 1–10 letters or digits');
     }
     try {
       const response = await callDestination(
@@ -1118,15 +1118,39 @@ module.exports = function (srv) {
         `/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV/A_CustomerReturn('${returnDocumentNumber}')?$format=json`
       );
       const returnData = unwrap(response.data);
-      const received = returnData.GoodsMovementStatus === 'C';   // C = completely processed
 
-      console.log(`getReturnStatus for ${returnDocumentNumber}: GoodsMovementStatus=${returnData.GoodsMovementStatus}, received=${received}`);
+      // Returns delivery items; the reference may be stored with leading zeros
+      const deliveryItems = async (ref) => {
+        const filter = encodeURIComponent(`ReferenceSDDocument eq '${ref}'`);
+        const res = await callDestination('GET',
+          `/sap/opu/odata/sap/API_CUSTOMER_RETURNS_DELIVERY_SRV;v=0002/A_ReturnsDeliveryItem?$filter=${filter}` +
+          '&$select=DeliveryDocument,GoodsMovementStatus&$format=json');
+        return unwrap(res.data).results || [];
+      };
+      let items = await deliveryItems(returnDocumentNumber);
+      if (!items.length && /^\d{1,9}$/.test(returnDocumentNumber)) {
+        items = await deliveryItems(returnDocumentNumber.padStart(10, '0'));
+      }
+
+      // All items C = received; any B or C = partly; otherwise A
+      const statuses = items.map((i) => i.GoodsMovementStatus);
+      let goodsMovementStatus = 'NO_DELIVERY';
+      if (items.length) {
+        if (statuses.every((st) => st === 'C')) goodsMovementStatus = 'C';
+        else if (statuses.some((st) => st === 'B' || st === 'C')) goodsMovementStatus = 'B';
+        else goodsMovementStatus = 'A';
+      }
+      const received = goodsMovementStatus === 'C';
+      const returnsDelivery = [...new Set(items.map((i) => String(i.DeliveryDocument).replace(/^0+(?=\d)/, '')))].join(',');
+
+      console.log(`getReturnStatus for ${returnDocumentNumber}: returns delivery ${returnsDelivery || '-'}, GoodsMovementStatus=${goodsMovementStatus}, received=${received}`);
 
       return {
         returnDocumentNumber,
         // The API calls the field OverallSDProcessStatus; older name kept as fallback
         overallProcessingStatus: returnData.OverallSDProcessStatus ?? returnData.OverallProcessingStatus,
-        goodsMovementStatus: returnData.GoodsMovementStatus || 'UNKNOWN',
+        returnsDelivery,
+        goodsMovementStatus,
         received
       };
     } catch (err) {

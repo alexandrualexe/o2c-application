@@ -24,6 +24,7 @@ const MAX_TOP = 500;          // Upper limit for the "top" parameter
 const PAGE_SIZE = 100;        // Rows per SAP request when paging with $skip
 const DUE_LIST_PAGE = 25;     // Billing due list: small pages, so one unreadable row costs little
 const GRACE_DAYS_POD = 3;     // Deliveries shipped in the last 3 days are not yet "awaiting POD"
+const RETURN_CREDIT_DAYS = 7;  // A return older than this without a credit memo is a finding (5.2.1)
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const DELIVERY_PATH = '/sap/opu/odata/sap/API_OUTBOUND_DELIVERY_SRV;v=0002';
@@ -32,6 +33,7 @@ const BILLING_PATH = '/sap/opu/odata/sap/API_BILLING_DOCUMENT_SRV';
 const RECEIVABLES_PATH = '/sap/opu/odata/sap/FAR_CUSTOMER_LINE_ITEMS';
 const DUE_LIST_PATH = '/sap/opu/odata/sap/SD_CUSTOMER_INVOICES_CREATE';
 const PARTNER_PATH = '/sap/opu/odata/sap/API_BUSINESS_PARTNER';
+const RETURN_PATH = '/sap/opu/odata/sap/API_CUSTOMER_RETURN_SRV';
 
 // Company code currency, used when SAP returns no line items to take it from
 const COMPANY_CODE_CURRENCY = { YDE1: 'EUR', YRO1: 'RON' };
@@ -97,6 +99,18 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
       if (page.length < size) break;
     }
     return rows;
+  }
+
+  // An invoice plus its cancellation is not an invoice: returns the cancelled invoices and the
+  // cancellation documents among billingKeys. A header SAP does not return counts as in force.
+  async function notInForce(trace, billingKeys) {
+    if (!billingKeys.length) return new Set();
+    const headers = await getAll(trace, `${BILLING_PATH}/A_BillingDocument`,
+      [['$filter', orFilter('BillingDocument', billingKeys)],
+        ['$select', 'BillingDocument,BillingDocumentIsCancelled,CancelledBillingDocument']], 1000, 1000);
+    return new Set(headers
+      .filter((h) => toBool(h.BillingDocumentIsCancelled) || h.CancelledBillingDocument)
+      .map((h) => noZeros(h.BillingDocument)));
   }
 
   // Wraps a handler: runs it with a fresh trace and returns the JSON envelope.
@@ -346,19 +360,10 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
 
     const deliveryKeys = [...new Set(deliveryItems.map((i) => i.DeliveryDocument))];
     const deliveries = deliveryKeys.map(noZeros);
-    // An invoice plus its cancellation is not an invoice: drop cancelled invoices and the
-    // cancellation documents themselves. A header SAP does not return is kept (in force).
+    // Cancelled invoices and cancellation documents do not count as billed
     const billingKeys = [...new Set(billingItems.map((i) => i.BillingDocument))];
-    let notInForce = new Set();
-    if (billingKeys.length) {
-      const headers = await getAll(trace, `${BILLING_PATH}/A_BillingDocument`,
-        [['$filter', orFilter('BillingDocument', billingKeys)],
-          ['$select', 'BillingDocument,BillingDocumentIsCancelled,CancelledBillingDocument']], 1000, 1000);
-      notInForce = new Set(headers
-        .filter((h) => toBool(h.BillingDocumentIsCancelled) || h.CancelledBillingDocument)
-        .map((h) => noZeros(h.BillingDocument)));
-    }
-    const billingDocuments = billingKeys.map(noZeros).filter((b) => !notInForce.has(b));
+    const cancelled = await notInForce(trace, billingKeys);
+    const billingDocuments = billingKeys.map(noZeros).filter((b) => !cancelled.has(b));
 
     // Delivered but not billed: read the POD status, because an open POD is the cause (3.4.1)
     let podOpen = [];
@@ -425,6 +430,54 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
       billingDocuments,
       findings
     };
+  });
+
+  // ---- 8 · listReturnsWithoutCredit: customer returns older than 7 days without a credit memo ----
+  // The credit memo for a return is a billing document whose items point to the return
+  // (SalesDocument). Cancelled credit memos do not count.
+  readFunction('listReturnsWithoutCredit', async (req, trace) => {
+    const top = toTop(req.data.top, MAX_TOP);
+    const { soldToParty } = req.data;
+    if (top === null) return req.reject(400, `top must be a whole number between 1 and ${MAX_TOP}`);
+    if (soldToParty && !isId(soldToParty)) return req.reject(400, 'soldToParty must be 1–10 letters or digits');
+
+    let filter = `CreationDate le datetime'${daysAgo(RETURN_CREDIT_DAYS)}T00:00:00'`;
+    if (soldToParty) filter += ` and SoldToParty eq '${soldToParty}'`;
+    const returns = (await getAll(trace, `${RETURN_PATH}/A_CustomerReturn`,
+      [['$filter', filter], ['$orderby', 'CreationDate asc']], top))
+      .filter((r) => r.OverallSDDocumentRejectionSts !== 'C');   // Fully rejected: nothing to credit
+
+    // Billing items that reference the returns, 40 returns per request to keep the URL short
+    const billingItems = [];
+    for (let i = 0; i < returns.length; i += 40) {
+      const keys = returns.slice(i, i + 40).map((r) => r.CustomerReturn);
+      billingItems.push(...await getAll(trace, `${BILLING_PATH}/A_BillingDocumentItem`,
+        [['$filter', orFilter('SalesDocument', keys)], ['$select', 'BillingDocument,SalesDocument']], 5000, 5000));
+    }
+    const cancelled = await notInForce(trace, [...new Set(billingItems.map((b) => b.BillingDocument))]);
+    const credited = new Set(billingItems
+      .filter((b) => !cancelled.has(noZeros(b.BillingDocument)))
+      .map((b) => noZeros(b.SalesDocument)));
+
+    const open = returns
+      .filter((r) => !credited.has(noZeros(r.CustomerReturn)))
+      .map((r) => {
+        const created = toDate(r.CreationDate);
+        return {
+          CustomerReturn: noZeros(r.CustomerReturn),
+          CustomerReturnType: r.CustomerReturnType,
+          SalesOrganization: r.SalesOrganization,
+          SoldToParty: noZeros(r.SoldToParty),
+          CreationDate: created,
+          daysSinceCreation: daysSince(created),
+          TotalNetAmount: toAmount(r.TotalNetAmount),
+          TransactionCurrency: r.TransactionCurrency,
+          SDDocumentReason: r.SDDocumentReason,
+          HeaderBillingBlockReason: r.HeaderBillingBlockReason,
+          OverallSDProcessStatus: r.OverallSDProcessStatus
+        };
+      });
+    return { count: open.length, returns: open };
   });
 };
 

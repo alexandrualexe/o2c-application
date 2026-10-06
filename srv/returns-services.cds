@@ -119,7 +119,9 @@ service ReturnsService {
   type ReturnStatusResult {
     returnDocumentNumber    : String;
     overallProcessingStatus : String;   // SAP OverallSDProcessStatus (A = open, B = in process, C = completed)
-    goodsMovementStatus     : String;   // 'C' = goods received; 'UNKNOWN' if SAP does not send it
+    returnsDelivery         : String;   // Returns delivery (or deliveries, comma-separated) for the return
+    goodsMovementStatus     : String;   // From the returns delivery items: A not received, B partly, C received;
+                                        // 'NO_DELIVERY' when there is no returns delivery yet
     received                : Boolean;  // true when goodsMovementStatus = 'C'
   };
 
@@ -242,6 +244,8 @@ service ReturnsService {
   function getCustomerAddresses(partners: String) returns LargeString;
   // Sales order -> delivery -> billing conformance check
   function checkOrderConformance(salesOrder: String) returns LargeString;
+  // Customer returns older than 7 days without a credit memo (5.2.1); top 1..500 (default 500)
+  function listReturnsWithoutCredit(top: Integer, soldToParty: String) returns LargeString;
 
   // ---------- Write ----------
   // Actions that create or change documents in SAP. Each one requires an
