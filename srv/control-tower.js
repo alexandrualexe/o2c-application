@@ -22,6 +22,7 @@
 const SAP_CLIENT = '100';
 const MAX_TOP = 500;          // Upper limit for the "top" parameter
 const PAGE_SIZE = 100;        // Rows per SAP request when paging with $skip
+const DUE_LIST_PAGE = 25;     // Billing due list: small pages, so one unreadable row costs little
 const GRACE_DAYS_POD = 3;     // Deliveries shipped in the last 3 days are not yet "awaiting POD"
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -245,9 +246,42 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
     if (!isId(soldToParty)) return req.reject(400, 'soldToParty must be 1–10 letters or digits');
     if (top === null) return req.reject(400, `top must be a whole number between 1 and ${MAX_TOP}`);
 
-    // This service answers 500 to $orderby, so the list is taken in SAP's order (single page)
-    const rows = (await get(trace, `${DUE_LIST_PATH}/C_BillingDueListItem_F0798`,
-      [['$filter', `SoldToParty eq '${soldToParty}'`], ['$top', top]])).results || [];
+    // This service answers 500 to $orderby, so the list is taken in SAP's order. It also
+    // answers 500 for a whole page when one row in it is unreadable: such a page is read
+    // again row by row, and the rows that still fail are skipped and counted.
+    const path = `${DUE_LIST_PATH}/C_BillingDueListItem_F0798`;
+    const params = [['$filter', `SoldToParty eq '${soldToParty}'`]];
+    const is500 = (err) => err.response?.status === 500;
+    const readPage = async (skip, size) =>
+      (await get(trace, path, [...params, ['$top', size], ['$skip', skip]])).results || [];
+
+    const rows = [];
+    let skippedRows = 0;
+    for (let skip = 0; rows.length < top;) {
+      const size = Math.min(DUE_LIST_PAGE, top - rows.length);
+      let page;
+      let failed = 0;
+      try {
+        page = await readPage(skip, size);
+      } catch (err) {
+        if (!is500(err)) throw err;
+        page = [];
+        for (let n = skip; n < skip + size; n++) {
+          try {
+            const one = await readPage(n, 1);
+            if (!one.length) break;       // End of the list
+            page.push(...one);
+          } catch (rowErr) {
+            if (!is500(rowErr)) throw rowErr;
+            failed++;
+          }
+        }
+      }
+      rows.push(...page);
+      skippedRows += failed;
+      skip += page.length + failed;
+      if (page.length + failed < size) break;   // Short page: the list has ended
+    }
 
     const items = rows.map((i) => ({
       ReferenceSDDocument: noZeros(i.ReferenceSDDocument),
@@ -257,7 +291,7 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
       BillingDocumentDate: toDate(i.BillingDocumentDate),
       SoldToParty: noZeros(i.SoldToParty)
     }));
-    return { total: items.length, items };
+    return { total: items.length, items, skippedRows };
   });
 
   // ---- 6 · getCustomerAddresses: country/city and name per business partner ----
@@ -312,7 +346,19 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
 
     const deliveryKeys = [...new Set(deliveryItems.map((i) => i.DeliveryDocument))];
     const deliveries = deliveryKeys.map(noZeros);
-    const billingDocuments = [...new Set(billingItems.map((i) => noZeros(i.BillingDocument)))];
+    // An invoice plus its cancellation is not an invoice: drop cancelled invoices and the
+    // cancellation documents themselves. A header SAP does not return is kept (in force).
+    const billingKeys = [...new Set(billingItems.map((i) => i.BillingDocument))];
+    let notInForce = new Set();
+    if (billingKeys.length) {
+      const headers = await getAll(trace, `${BILLING_PATH}/A_BillingDocument`,
+        [['$filter', orFilter('BillingDocument', billingKeys)],
+          ['$select', 'BillingDocument,BillingDocumentIsCancelled,CancelledBillingDocument']], 1000, 1000);
+      notInForce = new Set(headers
+        .filter((h) => toBool(h.BillingDocumentIsCancelled) || h.CancelledBillingDocument)
+        .map((h) => noZeros(h.BillingDocument)));
+    }
+    const billingDocuments = billingKeys.map(noZeros).filter((b) => !notInForce.has(b));
 
     // Delivered but not billed: read the POD status, because an open POD is the cause (3.4.1)
     let podOpen = [];
@@ -324,6 +370,13 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
         .filter((h) => ['A', 'B'].includes(h.OverallProofOfDeliveryStatus))
         .map((h) => noZeros(h.DeliveryDocument));
     }
+
+    // Billing blocks: the header one (order) and item ones (delivery items, not shown on the due list)
+    const billingBlocks = [
+      ...(order.HeaderBillingBlockReason ? [`header block ${order.HeaderBillingBlockReason}`] : []),
+      ...deliveryItems.filter((i) => i.ItemBillingBlockReason).map((i) =>
+        `item block ${i.ItemBillingBlockReason} on delivery ${noZeros(i.DeliveryDocument)} item ${noZeros(i.DeliveryDocumentItem)}`)
+    ];
 
     // Steps and wording follow the Control Tower's L4 table
     // (2.3.3 · 4.1.4 -> 3 Block Buster, 3.4.1 -> 6 POD Chaser, 4.1.1 -> 7 Billing Gatekeeper)
@@ -343,16 +396,16 @@ module.exports = function registerControlTower(srv, { callDestination, handleErr
       findings.push({
         severity: 'high',
         l4: '3.4.1',
-        step: 'Proof of Delivery: Confirm POD (VLPOD)',
+        step: 'Request proof of delivery (POD) from the logistics provider (VL06P)',
         finding: `Goods issued, proof of delivery still open (${podOpen.join(', ')}): billing waits for POD.`,
         routeTo: 'pod'
       });
-    } else if (deliveries.length && !billingDocuments.length && order.HeaderBillingBlockReason) {
+    } else if (deliveries.length && !billingDocuments.length && billingBlocks.length) {
       findings.push({
         severity: 'medium',
         l4: '4.1.4',
         step: 'Remove billing block (VA02)',
-        finding: `Delivered but billing block ${order.HeaderBillingBlockReason} is set: billing cannot proceed.`,
+        finding: `Delivered but blocked for billing (${billingBlocks.join('; ')}): billing cannot proceed.`,
         routeTo: 'blocks'
       });
     } else if (deliveries.length && !billingDocuments.length) {

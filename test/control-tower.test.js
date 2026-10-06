@@ -196,9 +196,36 @@ describe('listBillingDueList', () => {
       items: [{
         ReferenceSDDocument: '80000123', NetAmount: '540.00', TransactionCurrency: 'EUR',
         HasError: false, BillingDocumentDate: '2026-10-01', SoldToParty: '10044'
-      }]
+      }],
+      skippedRows: 0
     });
     expect(out.underlyingRequests[0]).not.toContain('$orderby');
+  });
+});
+
+describe('listBillingDueList: unreadable rows', () => {
+  test('a page with a bad row is re-read row by row; the bad row is skipped and counted', async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => ({ ReferenceSDDocument: String(80000100 + i), NetAmount: '1' }));
+    const bad = 7;   // Row 7 breaks every request that includes it
+    routes = {
+      C_BillingDueListItem_F0798: (url) => {
+        const top = Number(/\$top=(\d+)/.exec(url)[1]);
+        const skip = Number(/\$skip=(\d+)/.exec(url)[1]);
+        if (skip <= bad && bad < skip + top) return Object.assign(new Error('Data Services'), { response: { status: 500, data: {} } });
+        return { results: rows.slice(skip, skip + top) };
+      }
+    };
+    const out = await call("listBillingDueList(soldToParty='10021',top=100)");
+    expect(out.response.skippedRows).toBe(1);
+    expect(out.response.total).toBe(29);
+    expect(out.response.items.map((i) => i.ReferenceSDDocument)).not.toContain('80000107');
+    expect(out.underlyingRequests).toContain(
+      "GET /sap/opu/odata/sap/SD_CUSTOMER_INVOICES_CREATE/C_BillingDueListItem_F0798?$filter=SoldToParty eq '10021'&$top=1&$skip=7&$format=json&sap-client=100");
+  });
+
+  test('an error other than 500 is not retried row by row: it stays an HTTP error', async () => {
+    routes = { C_BillingDueListItem_F0798: () => Object.assign(new Error('down'), { response: { status: 503, data: {} } }) };
+    expect(await status("listBillingDueList(soldToParty='10021')")).toBe(503);
   });
 });
 
@@ -289,7 +316,7 @@ describe('checkOrderConformance', () => {
     const out = await call("checkOrderConformance(salesOrder='1876')");
     expect(out.response.findings).toEqual([{
       severity: 'high', l4: '3.4.1',
-      step: 'Proof of Delivery: Confirm POD (VLPOD)',
+      step: 'Request proof of delivery (POD) from the logistics provider (VL06P)',
       finding: 'Goods issued, proof of delivery still open (80000001): billing waits for POD.',
       routeTo: 'pod'
     }]);
@@ -307,9 +334,43 @@ describe('checkOrderConformance', () => {
     expect(out.response.findings).toEqual([{
       severity: 'medium', l4: '4.1.4',
       step: 'Remove billing block (VA02)',
-      finding: 'Delivered but billing block 02 is set: billing cannot proceed.',
+      finding: 'Delivered but blocked for billing (header block 02): billing cannot proceed.',
       routeTo: 'blocks'
     }]);
+  });
+
+  test('item billing block on a delivery item -> 4.1.4, although the header has none', async () => {
+    routes = {
+      "A_SalesOrder('1876')": order(),
+      A_OutbDeliveryItem: [
+        { DeliveryDocument: '0080000001', DeliveryDocumentItem: '000010', ItemBillingBlockReason: '03' },
+        { DeliveryDocument: '0080000001', DeliveryDocumentItem: '000020', ItemBillingBlockReason: '' }
+      ]
+    };
+    const out = await call("checkOrderConformance(salesOrder='1876')");
+    expect(out.response.findings).toEqual([{
+      severity: 'medium', l4: '4.1.4',
+      step: 'Remove billing block (VA02)',
+      finding: 'Delivered but blocked for billing (item block 03 on delivery 80000001 item 10): billing cannot proceed.',
+      routeTo: 'blocks'
+    }]);
+  });
+
+  test('invoice cancelled -> not billed, 4.1.1 finding', async () => {
+    routes = {
+      "A_SalesOrder('1876')": order(),
+      A_OutbDeliveryItem: [{ DeliveryDocument: '80000001' }],
+      A_BillingDocumentItem: [{ BillingDocument: '0090000376' }, { BillingDocument: '0090000377' }],
+      'A_BillingDocument?': [
+        { BillingDocument: '0090000376', BillingDocumentIsCancelled: true, CancelledBillingDocument: '' },
+        { BillingDocument: '0090000377', BillingDocumentIsCancelled: false, CancelledBillingDocument: '0090000376' }
+      ]
+    };
+    const out = await call("checkOrderConformance(salesOrder='1876')");
+    expect(out.response.billingDocuments).toEqual([]);
+    expect(out.response.findings.map((f) => f.l4)).toEqual(['4.1.1']);
+    expect(out.underlyingRequests.find((r) => r.includes('A_BillingDocument?'))).toContain(
+      "BillingDocument eq '0090000376' or BillingDocument eq '0090000377'");
   });
 
   test('billed order -> POD status is not read', async () => {
